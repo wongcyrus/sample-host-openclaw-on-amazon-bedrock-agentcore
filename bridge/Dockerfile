@@ -109,6 +109,7 @@ RUN mkdir -p /root/.openclaw
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
+COPY dashboard-gateway.js /app/dashboard-gateway.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js

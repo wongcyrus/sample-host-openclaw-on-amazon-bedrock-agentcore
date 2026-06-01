@@ -29,6 +29,10 @@ const workspaceSync = require("./workspace-sync");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
+const {
+  fetchGatewaySnapshot,
+  streamGatewayEvents,
+} = require("./dashboard-gateway");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -115,6 +119,117 @@ let lastActivityTime = Math.floor(Date.now() / 1000);
 // Message queue for serializing concurrent requests (OpenClaw WebSocket path)
 let messageQueue = [];
 let processingMessage = false;
+const dashboardClients = new Set();
+const dashboardWss = new WebSocket.WebSocketServer({ noServer: true });
+const DASHBOARD_EVENT_BUFFER_LIMIT = 250;
+let dashboardEventSeq = 0;
+let dashboardEventBuffer = [];
+let dashboardEventStatus = {
+  type: "dashboard-status",
+  status: "idle",
+  source: `ws://127.0.0.1:${OPENCLAW_PORT}`,
+  ts: Date.now(),
+};
+let dashboardEventStream = null;
+const DASHBOARD_DEFAULT_AGENT_ID = "main";
+
+function recordDashboardEvent(event) {
+  dashboardEventSeq += 1;
+  dashboardEventBuffer.push({
+    ...event,
+    seq: dashboardEventSeq,
+    ts: Date.now(),
+  });
+  if (dashboardEventBuffer.length > DASHBOARD_EVENT_BUFFER_LIMIT) {
+    dashboardEventBuffer = dashboardEventBuffer.slice(
+      -DASHBOARD_EVENT_BUFFER_LIMIT,
+    );
+  }
+}
+
+function updateDashboardEventStatus(status, extra = {}) {
+  dashboardEventStatus = {
+    type: "dashboard-status",
+    status,
+    source: `ws://127.0.0.1:${OPENCLAW_PORT}`,
+    ts: Date.now(),
+    ...extra,
+  };
+}
+
+function stopDashboardEventStream() {
+  if (dashboardEventStream) {
+    dashboardEventStream.close();
+    dashboardEventStream = null;
+  }
+}
+
+function startDashboardEventStream() {
+  if (dashboardEventStream || !openclawReady) {
+    return;
+  }
+
+  updateDashboardEventStatus("connecting", {
+    protocolVersion: GATEWAY_PROTOCOL_VERSION,
+  });
+
+  dashboardEventStream = streamGatewayEvents({
+    token: GATEWAY_TOKEN || "",
+    port: OPENCLAW_PORT,
+    protocolVersion: GATEWAY_PROTOCOL_VERSION,
+    onStatus: (payload) => {
+      updateDashboardEventStatus(payload.status, payload);
+    },
+    onEvent: (payload) => {
+      recordDashboardEvent(payload);
+    },
+    onError: (err) => {
+      updateDashboardEventStatus("error", { error: err.message });
+      stopDashboardEventStream();
+    },
+  });
+}
+
+function getDashboardEventsSince(since = 0, limit = 100) {
+  const minSeq = Number.isFinite(since) ? Math.max(0, Math.floor(since)) : 0;
+  const clampedLimit = Math.min(
+    100,
+    Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 100),
+  );
+  const events = dashboardEventBuffer
+    .filter((event) => event.seq > minSeq)
+    .slice(-clampedLimit);
+
+  return {
+    events,
+    nextSeq: dashboardEventSeq,
+    streamStatus: dashboardEventStatus,
+  };
+}
+
+function createSyntheticDashboardRunId(prefix = "synthetic") {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function emitSyntheticDashboardResponse(runId, responseText, phase = "end") {
+  if (responseText && String(responseText).trim()) {
+    recordDashboardEvent({
+      type: "agent-message",
+      runId,
+      role: "assistant",
+      content: String(responseText),
+      agentId: DASHBOARD_DEFAULT_AGENT_ID,
+      sessionKey: `agent:${DASHBOARD_DEFAULT_AGENT_ID}`,
+    });
+  }
+
+  recordDashboardEvent({
+    type: "agent-lifecycle",
+    runId,
+    phase,
+    agentId: DASHBOARD_DEFAULT_AGENT_ID,
+  });
+}
 
 /**
  * Write current actorId and channel to a shared file so the proxy process
@@ -181,6 +296,75 @@ function updateIdentityFile(actorId, channel) {
   } catch (err) {
     console.warn(`[contract] Failed to write identity file: ${err.message}`);
   }
+}
+
+async function ensureDashboardReady({
+  userId,
+  actorId,
+  channel,
+} = {}) {
+  const deadline = Date.now() + 120000;
+  const pollMs = 500;
+
+  if (openclawReady && proxyReady) {
+    startDashboardEventStream();
+    return { ok: true };
+  }
+
+  if (!initInProgress) {
+    if (!userId || !actorId) {
+      return {
+        ok: false,
+        status: "initializing",
+        error:
+          "dashboard access requires userId and actorId before the session is ready",
+      };
+    }
+
+    updateIdentityFile(actorId, channel || "unknown");
+
+    try {
+      await init(userId, actorId, channel || "unknown");
+    } catch (err) {
+      return {
+        ok: false,
+        status: "error",
+        error: `Agent initialization failed: ${err.message}`,
+      };
+    }
+  } else {
+    try {
+      await initPromise;
+    } catch (err) {
+      return {
+        ok: false,
+        status: "error",
+        error: `Agent initialization failed: ${err.message}`,
+      };
+    }
+  }
+
+  while ((!openclawReady || !proxyReady) && Date.now() < deadline) {
+    if (openclawExitCode !== null) {
+      return {
+        ok: false,
+        status: "error",
+        error: `OpenClaw exited before becoming ready (exit code ${openclawExitCode})`,
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  if (!openclawReady || !proxyReady) {
+    return {
+      ok: false,
+      status: "initializing",
+      error: "Agent not ready before dashboard timeout",
+    };
+  }
+
+  startDashboardEventStream();
+  return { ok: true };
 }
 
 /**
@@ -641,6 +825,7 @@ async function pollOpenClawReadiness(namespace) {
   const ready = await waitForPort(OPENCLAW_PORT, "OpenClaw", 300000, 5000);
   if (ready) {
     openclawReady = true;
+    startDashboardEventStream();
     workspaceSync.startPeriodicSave(namespace);
     console.log(
       "[contract] OpenClaw ready — switching from lightweight agent to full OpenClaw",
@@ -829,6 +1014,8 @@ function scheduleOpenClawRestart(namespace) {
       );
       openclawExitCode = code2;
       openclawReady = false;
+      stopDashboardEventStream();
+      updateDashboardEventStatus("disconnected", { exitCode: code2 });
       scheduleOpenClawRestart(namespace);
     });
     // Poll for readiness after restart
@@ -1026,6 +1213,8 @@ async function init(userId, actorId, channel) {
       console.log(`[contract] OpenClaw exited with code ${code}`);
       openclawExitCode = code;
       openclawReady = false;
+      stopDashboardEventStream();
+      updateDashboardEventStatus("disconnected", { exitCode: code });
       scheduleOpenClawRestart(currentNamespace);
     });
 
@@ -1734,6 +1923,79 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        if (action === "dashboard_snapshot") {
+          lastActivityTime = Math.floor(Date.now() / 1000);
+          const { userId, actorId, channel } = payload;
+          const ready = await ensureDashboardReady({ userId, actorId, channel });
+          if (!ready.ok) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: ready.status,
+                error: ready.error,
+              }),
+            );
+            return;
+          }
+
+          try {
+            const snapshot = await fetchGatewaySnapshot({
+              token: GATEWAY_TOKEN || "",
+              port: OPENCLAW_PORT,
+              protocolVersion: GATEWAY_PROTOCOL_VERSION,
+            });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: "ready",
+                snapshot,
+                userId: currentUserId,
+                sessionId: payload.sessionId || null,
+              }),
+            );
+          } catch (err) {
+            console.error(`[contract] Dashboard snapshot failed: ${err.message}`);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: "error",
+                error: "Failed to fetch dashboard snapshot",
+              }),
+            );
+          }
+          return;
+        }
+
+        if (action === "dashboard_events") {
+          lastActivityTime = Math.floor(Date.now() / 1000);
+          const { userId, actorId, channel } = payload;
+          const ready = await ensureDashboardReady({ userId, actorId, channel });
+          if (!ready.ok) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                status: ready.status,
+                error: ready.error,
+              }),
+            );
+            return;
+          }
+
+          const since = Number(payload.since || 0);
+          const limit = Number(payload.limit || 100);
+          const eventPayload = getDashboardEventsSince(since, limit);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              status: "ready",
+              ...eventPayload,
+              userId: currentUserId,
+              sessionId: payload.sessionId || null,
+            }),
+          );
+          return;
+        }
+
         // Cron action — blocks until init completes, then bridges the message
         if (action === "cron") {
           const { userId, actorId, channel, message } = payload;
@@ -1784,6 +2046,7 @@ const server = http.createServer(async (req, res) => {
           lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
           let responseText;
+          let syntheticDashboardRunId = null;
           try {
             // Enqueue message (serialized with chat messages to prevent WebSocket races)
             try {
@@ -1803,6 +2066,8 @@ const server = http.createServer(async (req, res) => {
                 "[contract] Cron bridge returned empty — falling back to lightweight agent",
               );
               try {
+                syntheticDashboardRunId =
+                  createSyntheticDashboardRunId("cron-lightweight-fallback");
                 responseText = await agent.chat(message, actorId, Date.now() + 30000);
               } catch (agentErr) {
                 responseText =
@@ -1811,6 +2076,12 @@ const server = http.createServer(async (req, res) => {
                   `[contract] Cron lightweight agent fallback error: ${agentErr.message}`,
                 );
               }
+            }
+            if (syntheticDashboardRunId) {
+              emitSyntheticDashboardResponse(
+                syntheticDashboardRunId,
+                extractTextFromContent(responseText),
+              );
             }
           } finally {
             activeTaskCount = Math.max(0, activeTaskCount - 1);
@@ -1907,6 +2178,7 @@ const server = http.createServer(async (req, res) => {
           lastActivityTime = Math.floor(Date.now() / 1000);
           activeTaskCount++;
           let responseText;
+          let syntheticDashboardRunId = null;
           try {
             // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
             if (openclawReady) {
@@ -1965,11 +2237,14 @@ const server = http.createServer(async (req, res) => {
                   );
                   responseText =
                     "I'm still working on your previous request — check back in a moment.";
+                  syntheticDashboardRunId = createSyntheticDashboardRunId("busy");
                 } else {
                   console.warn(
                     "[contract] Bridge returned empty — falling back to lightweight agent",
                   );
                   try {
+                    syntheticDashboardRunId =
+                      createSyntheticDashboardRunId("lightweight-fallback");
                     responseText = await agent.chat(
                       bridgeText,
                       actorId,
@@ -1988,6 +2263,8 @@ const server = http.createServer(async (req, res) => {
               // Warm-up shim path — lightweight agent via proxy
               console.log("[contract] Routing via lightweight agent (warm-up)");
               try {
+                syntheticDashboardRunId =
+                  createSyntheticDashboardRunId("lightweight-warmup");
                 responseText = await agent.chat(bridgeText, actorId, Date.now() + 620000);
               } catch (agentErr) {
                 responseText = `I'm having trouble right now. Please try again in a moment.`;
@@ -2005,6 +2282,9 @@ const server = http.createServer(async (req, res) => {
 
           // Belt-and-suspenders: strip any remaining content-block JSON wrappers
           if (responseText) responseText = extractTextFromContent(responseText);
+          if (syntheticDashboardRunId) {
+            emitSyntheticDashboardResponse(syntheticDashboardRunId, responseText);
+          }
 
           // Finalize Telegram streaming (final edit without "..." suffix)
           let telegramStreamed = false;
@@ -2060,6 +2340,101 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
+dashboardWss.on("connection", async (ws, req) => {
+  dashboardClients.add(ws);
+  const parsedUrl = new URL(req.url, "http://127.0.0.1");
+  const userId = parsedUrl.searchParams.get("userId") || undefined;
+  const actorId = parsedUrl.searchParams.get("actorId") || undefined;
+  const channel = parsedUrl.searchParams.get("channel") || undefined;
+
+  const sendJson = (payload) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+    }
+  };
+
+  try {
+    const ready = await ensureDashboardReady({ userId, actorId, channel });
+    if (!ready.ok) {
+      sendJson({
+        type: "dashboard-status",
+        status: ready.status,
+        error: ready.error,
+      });
+      ws.close();
+      return;
+    }
+
+    try {
+      const snapshot = await fetchGatewaySnapshot({
+        token: GATEWAY_TOKEN || "",
+        port: OPENCLAW_PORT,
+        protocolVersion: GATEWAY_PROTOCOL_VERSION,
+      });
+      sendJson({
+        type: "dashboard-snapshot",
+        snapshot,
+      });
+    } catch (err) {
+      sendJson({
+        type: "dashboard-status",
+        status: "error",
+        error: `Failed to fetch initial snapshot: ${err.message}`,
+      });
+    }
+
+    const stream = streamGatewayEvents({
+      token: GATEWAY_TOKEN || "",
+      port: OPENCLAW_PORT,
+      protocolVersion: GATEWAY_PROTOCOL_VERSION,
+      onStatus: sendJson,
+      onEvent: sendJson,
+      onError: (err) => {
+        sendJson({
+          type: "dashboard-status",
+          status: "error",
+          error: err.message,
+        });
+      },
+    });
+
+    ws.on("close", () => {
+      dashboardClients.delete(ws);
+      stream.close();
+    });
+    ws.on("error", () => {
+      dashboardClients.delete(ws);
+      stream.close();
+    });
+  } catch (err) {
+    sendJson({
+      type: "dashboard-status",
+      status: "error",
+      error: err.message,
+    });
+    ws.close();
+  }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, "http://127.0.0.1");
+  } catch {
+    socket.destroy();
+    return;
+  }
+
+  if (parsedUrl.pathname !== "/ws") {
+    socket.destroy();
+    return;
+  }
+
+  dashboardWss.handleUpgrade(req, socket, head, (ws) => {
+    dashboardWss.emit("connection", ws, req);
+  });
+});
+
 // --- SIGTERM handler: save workspace and exit gracefully ---
 process.on("SIGTERM", async () => {
   if (shuttingDown) return;
@@ -2067,6 +2442,9 @@ process.on("SIGTERM", async () => {
   console.log(
     "[contract] SIGTERM received — saving workspace and shutting down",
   );
+
+  stopDashboardEventStream();
+  updateDashboardEventStatus("stopped");
 
   // Stop credential refresh timer
   if (credentialRefreshTimer) {
@@ -2121,7 +2499,7 @@ server.listen(PORT, "0.0.0.0", () => {
     `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
   );
   console.log(
-    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron}",
+    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron|dashboard_snapshot|dashboard_events}, WS /ws",
   );
 
   // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)

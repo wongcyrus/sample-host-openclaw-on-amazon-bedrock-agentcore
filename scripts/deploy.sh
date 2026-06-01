@@ -370,9 +370,8 @@ validate_required_settings() {
   case "$MODE" in
     --phase1|--runtime-only)
       if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
-        echo "ERROR: TELEGRAM_BOT_TOKEN/TELEGRAM_ADMIN_USER_ID require a deployment mode that includes the Router stack."
-        echo "Use ./scripts/deploy.sh, ./scripts/deploy.sh --cdk-only, or ./scripts/deploy.sh --phase3."
-        errors=$((errors + 1))
+        echo "INFO: Ignoring TELEGRAM_BOT_TOKEN/TELEGRAM_ADMIN_USER_ID for $MODE."
+        echo "INFO: Router bootstrap runs only when the Router stack is deployed."
       fi
       ;;
   esac
