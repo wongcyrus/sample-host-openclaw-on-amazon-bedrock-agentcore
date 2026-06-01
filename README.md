@@ -111,6 +111,48 @@ flowchart LR
 
 See [docs/architecture-detailed.md](docs/architecture-detailed.md) for technical details (sequence diagrams, container internals, data flows).
 
+### Dashboard relay workaround
+
+The web dashboard integration is a **runtime-side adapter**, not a direct browser-to-OpenClaw connection.
+
+AgentCore runs each user in an isolated runtime session, and the internal OpenClaw gateway (`127.0.0.1:18789`) is only reachable from inside that runtime container. Because of that, a browser cannot directly subscribe to the same WebSocket that Telegram traffic uses.
+
+The implemented design is:
+
+```mermaid
+flowchart LR
+    TG[Telegram User] --> ROUTER[Router Lambda]
+    ROUTER -->|InvokeAgentRuntime action=chat| CONTRACT[AgentCore contract server]
+
+    subgraph RUNTIME[Per-user AgentCore runtime session]
+        CONTRACT -->|full mode| OPENCLAW[OpenClaw gateway :18789]
+        CONTRACT -->|warm-up / fallback| SHIM[lightweight-agent.js]
+        OPENCLAW --> REAL[Real dashboard events]
+        SHIM --> SYN[Synthetic dashboard events]
+        REAL --> BUFFER[In-memory dashboard event buffer]
+        SYN --> BUFFER
+    end
+
+    BROWSER[Browser dashboard] --> VITE[Vite / local Express relay]
+    VITE -->|InvokeAgentRuntime action=dashboard_snapshot| CONTRACT
+    VITE -->|poll action=dashboard_events| CONTRACT
+    BUFFER --> VITE
+```
+
+Key consequences:
+
+- the browser talks only to the **local dashboard relay**, not directly to the runtime gateway
+- live web updates are driven by **polled `dashboard_events`**, then rebroadcast locally over `/api/ws`
+- some dashboard events are **synthetic** because Telegram may be answered by the lightweight warm-up/fallback path before full OpenClaw emits a normal gateway event
+- the relay is **session-pinned**: the dashboard must target the same `actorId` / `userId` / `runtimeSessionId` as the Telegram conversation it wants to observe
+
+Today, the dashboard uses the two local endpoints differently:
+
+- `GET /api/openclaw/snapshot` still drives the character machine's `working` / `idle` state
+- `WS /api/ws` carries normalized live message events (`agent-message`, `agent-stream`, `agent-lifecycle`) plus relay-added status hints
+
+So the relay is no longer a raw OpenClaw WebSocket proxy; it is a normalized adapter that combines runtime events into a browser-friendly stream.
+
 ### Why S3 Workspace Sync?
 
 AgentCore microVMs are ephemeral — they're destroyed when idle. OpenClaw stores conversation history, user profiles, and agent configuration in the `.openclaw/` directory. **S3-backed workspace sync** restores this directory on session start, saves it periodically (every 5 min), and performs a final save on shutdown. Each user's workspace is isolated under a unique S3 prefix derived from their channel identity.
@@ -471,8 +513,8 @@ All tunable parameters are in `cdk.json`:
 | `cloudwatch_log_retention_days` | `30` | Log retention in days |
 | `daily_token_budget` | `1000000` | Daily token budget alarm threshold |
 | `daily_cost_budget_usd` | `5` | Daily cost budget alarm threshold (USD) |
-| `session_idle_timeout` | `1800` | Per-user session idle timeout (seconds) |
-| `session_max_lifetime` | `28800` | Per-user session max lifetime (seconds) |
+| `session_idle_timeout` | `1800` | Requested per-user session idle timeout (seconds). In `dev`, the effective value is clamped to the dev max lifetime. |
+| `session_max_lifetime` | `1800` non-dev default, `600` in `dev` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
 | `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
@@ -982,7 +1024,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 |---|---|
 | **Cold start time** | Lightweight agent responds in ~5-15s; full OpenClaw ready in ~1-2 min (plugin registration) |
 | **Image size** | Max 3.75 MB per image (Bedrock Converse API limit) |
-| **Session timeout** | Sessions terminate after 30 min idle (configurable via `session_idle_timeout`) |
+| **Session timeout** | Non-dev default: 30 min idle. `dev` default: 10 min total lifetime, with idle timeout clamped to that value |
 | **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup (~1-2 min). During warm-up, built-in web_fetch/web_search tools are available |
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
 | **No voice/video** | Only text and images supported; no audio or video messages |

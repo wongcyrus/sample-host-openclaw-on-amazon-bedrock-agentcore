@@ -115,6 +115,47 @@ sequenceDiagram
     C->>U: Display response
 ```
 
+### Dashboard Relay Flow (Browser → Local Relay → AgentCore)
+
+This path exists because the internal OpenClaw gateway WebSocket is only reachable inside the AgentCore runtime session. The browser cannot connect to it directly, so the dashboard uses a local relay plus runtime-side buffering.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser Dashboard
+    participant V as Local Express + Vite Relay
+    participant AC as AgentCore Contract
+    participant OC as OpenClaw Gateway
+    participant SH as Lightweight Agent
+    participant BUF as Dashboard Event Buffer
+
+    B->>V: WS /api/ws
+    loop every poll interval
+        V->>AC: InvokeAgentRuntime(action=dashboard_events, since=seq)
+        alt full OpenClaw path produced events
+            OC->>BUF: normalized gateway events
+        else warm-up/fallback path replied
+            SH->>AC: response text
+            AC->>BUF: synthetic dashboard events
+        end
+        BUF-->>AC: events after seq
+        AC-->>V: events + nextSeq
+        V-->>B: rebroadcast over local WS
+    end
+
+    B->>V: GET /api/openclaw/snapshot
+    V->>AC: InvokeAgentRuntime(action=dashboard_snapshot)
+    AC->>OC: fetch internal gateway snapshot
+    AC-->>V: snapshot payload
+    V-->>B: normalized snapshot response
+```
+
+**Notes:**
+
+- `dashboard_events` is backed by an **in-memory** buffer inside the runtime session, so it resets on session restart/redeploy.
+- The dashboard must be pinned to the same **actorId / userId / runtimeSessionId** as the Telegram user whose conversation it wants to mirror.
+- Synthetic events are required because the lightweight warm-up/fallback path can reply before the full OpenClaw gateway emits normal chat events.
+- The current dashboard frontend still derives `working` / `idle` from `dashboard_snapshot` polling. The WS relay mainly carries message events, plus relay-added status hints for future/live consumers.
+
 ### Cron Job Flow (Scheduled Task)
 
 ```mermaid
