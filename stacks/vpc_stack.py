@@ -32,6 +32,28 @@ class VpcStack(Stack):
         # Allow users to override AZs via context if AgentCore Runtime has AZ restrictions
         # Context: "availability_zones": ["us-east-1b", "us-east-1c"]
         availability_zones_raw = self.node.try_get_context("availability_zones")
+
+        # If no explicit AZs provided in us-east-1, auto-discover Bedrock-supported physical AZs.
+        if not availability_zones_raw and region == "us-east-1":
+            # Bedrock AgentCore in us-east-1 only supports specific physical AZs.
+            # us-east-1a (use1-az6) is unsupported (common cause of CREATE_FAILED).
+            supported_phys_ids = ["use1-az1", "use1-az2", "use1-az4"]
+            try:
+                ec2_client = boto3.client("ec2", region_name=region)
+                zones = ec2_client.describe_availability_zones(
+                    Filters=[{"Name": "zone-id", "Values": supported_phys_ids}]
+                ).get("AvailabilityZones", [])
+                availability_zones_raw = sorted([z["ZoneName"] for z in zones])
+                if availability_zones_raw:
+                    Annotations.of(self).add_info(
+                        f"Auto-selected Bedrock-supported AZs in us-east-1: {availability_zones_raw}"
+                    )
+            except Exception as e:
+                Annotations.of(self).add_warning(
+                    f"Failed to auto-discover supported AZs in us-east-1: {str(e)}. "
+                    "Falling back to default AZ selection."
+                )
+
         if isinstance(availability_zones_raw, str):
             availability_zones_raw = availability_zones_raw.strip()
             if availability_zones_raw:

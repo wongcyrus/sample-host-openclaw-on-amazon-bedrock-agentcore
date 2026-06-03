@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,11 +75,19 @@ def on_event(event, _context):
     if request_type == "Delete":
         return {"PhysicalResourceId": physical_id}
 
-    telegram_bot_token = (props.get("TelegramBotToken") or "").strip()
+    telegram_bot_token = (
+        os.environ.get("BOOTSTRAP_TELEGRAM_BOT_TOKEN")
+        or props.get("TelegramBotToken")
+        or ""
+    ).strip()
     telegram_secret_id = props["TelegramTokenSecretId"]
     webhook_secret_id = props["WebhookSecretId"]
     identity_table_name = props["IdentityTableName"]
-    telegram_admin_user_id = (props.get("TelegramAdminUserId") or "").strip()
+    telegram_admin_user_id = (
+        os.environ.get("BOOTSTRAP_TELEGRAM_ADMIN_USER_ID")
+        or props.get("TelegramAdminUserId")
+        or ""
+    ).strip()
     api_url = props["ApiUrl"]
 
     updated_secret = False

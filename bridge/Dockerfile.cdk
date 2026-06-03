@@ -8,8 +8,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# Install AWS CLI (for Secrets Manager in entrypoint)
-RUN pip3 install --no-cache-dir --break-system-packages awscli
+# Install AWS CLI and Python dependencies for bundled robot skills
+RUN pip3 install --no-cache-dir --break-system-packages \
+    awscli \
+    boto3 \
+    requests \
+    requests-auth-aws-sigv4
 
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@2026.5.19 clawhub@0.8.0
@@ -89,6 +93,7 @@ COPY bridge/dashboard-gateway.js /app/dashboard-gateway.js
 COPY bridge/agentcore-proxy.js /app/agentcore-proxy.js
 COPY bridge/lightweight-agent.js /app/lightweight-agent.js
 COPY bridge/workspace-sync.js /app/workspace-sync.js
+COPY bridge/workspace-files.js /app/workspace-files.js
 COPY bridge/cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY bridge/scoped-credentials.js /app/scoped-credentials.js
 COPY bridge/force-ipv4.js /app/force-ipv4.js
@@ -107,6 +112,9 @@ RUN chmod +x /skills/api-keys/*.js
 
 COPY bridge/skills/agentcore-browser /skills/agentcore-browser
 RUN chmod +x /skills/agentcore-browser/*.js
+
+COPY bridge/skills/humanoid /skills/humanoid
+RUN chmod +x /skills/humanoid/run.sh
 
 COPY CLAUDE.md /app/CLAUDE.md
 COPY bridge/entrypoint.sh /app/entrypoint.sh

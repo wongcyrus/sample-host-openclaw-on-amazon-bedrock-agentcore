@@ -208,7 +208,7 @@ class StreamingMockWebSocket extends EventEmitter {
               stream: "thought",
               sessionKey: "agent:alpha",
               data: {
-                chunk: "thinking",
+                delta: "thinking",
               },
             },
           }));
@@ -306,5 +306,75 @@ describe("streamGatewayEvents", () => {
     assert.equal(StreamingMockWebSocket.instances[0].protocolVersion, 3);
     assert.equal(StreamingMockWebSocket.instances[1].protocolVersion, 4);
     assert.equal(statuses.at(-1).status, "connected");
+  });
+
+  it("normalizes missing agent ids to main and accepts text-only stream payloads", async () => {
+    const events = [];
+    class TextOnlyStreamWebSocket extends EventEmitter {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+
+      constructor() {
+        super();
+        this.readyState = TextOnlyStreamWebSocket.OPEN;
+        process.nextTick(() => {
+          this.emit("open");
+          this.emit("message", JSON.stringify({
+            type: "event",
+            event: "connect.challenge",
+          }));
+        });
+      }
+
+      send(payload, cb) {
+        const msg = JSON.parse(payload);
+        if (msg.method === "connect") {
+          process.nextTick(() => {
+            this.emit("message", JSON.stringify({
+              type: "res",
+              id: msg.id,
+              ok: true,
+              payload: {},
+            }));
+            this.emit("message", JSON.stringify({
+              type: "event",
+              event: "agent",
+              payload: {
+                runId: "run-2",
+                stream: "assistant",
+                sessionKey: "global",
+                data: {
+                  text: "hello from text payload",
+                },
+              },
+            }));
+          });
+        }
+        cb?.();
+      }
+
+      close() {
+        this.readyState = TextOnlyStreamWebSocket.CLOSED;
+      }
+    }
+
+    const stream = streamGatewayEvents({
+      token: "secret-token",
+      port: 18789,
+      wsImpl: TextOnlyStreamWebSocket,
+      onEvent: (event) => events.push(event),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    stream.close();
+
+    assert.deepStrictEqual(events[0], {
+      type: "agent-stream",
+      runId: "run-2",
+      stream: "assistant",
+      chunk: "hello from text payload",
+      agentId: "main",
+    });
   });
 });

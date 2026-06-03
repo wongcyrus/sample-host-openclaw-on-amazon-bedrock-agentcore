@@ -98,3 +98,5 @@ _(updated during loop — add lessons learned here)_
 - `CfnGuardrail` is an L1 construct — use `aws_cdk.aws_bedrock.CfnGuardrail`
 - `guardrailConfig` must be `undefined` (not null) when no guardrail ID — use conditional spread
 - Check `enable_guardrails` context with `self.node.try_get_context("enable_guardrails")`, default to `True`
+- Bedrock AgentCore in `us-east-1` only supports physical AZ IDs: `use1-az1`, `use1-az2`, `use1-az4`. `us-east-1a` (often `use1-az6`) is unsupported.
+- `VpcStack` now auto-discovers supported logical AZs in `us-east-1` using `boto3` to filter by `zone-id`.

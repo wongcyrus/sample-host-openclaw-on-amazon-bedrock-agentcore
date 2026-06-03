@@ -255,12 +255,11 @@ describe("CREDENTIAL_SCAN_EXEMPT", () => {
 // --- AGENTS.md template validation ---
 
 describe("AGENTS.md template in agentcore-contract.js", () => {
-  const fs = require("fs");
-  const path = require("path");
-  const source = fs.readFileSync(
-    path.join(__dirname, "agentcore-contract.js"),
-    "utf-8",
-  );
+  const { getWorkspaceDefaults } = require("./workspace-files");
+  const source = getWorkspaceDefaults({
+    browserEnabled: true,
+    humanoidEnabled: true,
+  })["AGENTS.md"];
 
   it("does not tell the LLM to 'Read' skill files (read tool is denied)", () => {
     // The read tool is denied in OpenClaw's tool profile, so AGENTS.md must not

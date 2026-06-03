@@ -469,6 +469,9 @@ const WORKSPACE_FILES = [
     purpose: "freeform notes and memories",
   },
 ];
+const PROXY_CONTEXT_FILES = WORKSPACE_FILES.filter((wf) =>
+  ["AGENTS.md", "SOUL.md", "USER.md", "IDENTITY.md"].includes(wf.filename),
+);
 const WORKSPACE_PER_FILE_MAX_CHARS = 4096;
 const WORKSPACE_TOTAL_MAX_CHARS = 20000;
 
@@ -489,7 +492,7 @@ function buildIdentityText(actorId, channel, workspaceContents) {
   let totalChars = 0;
   const fileSections = [];
   const skippedFiles = new Set();
-  for (const wf of WORKSPACE_FILES) {
+  for (const wf of PROXY_CONTEXT_FILES) {
     const raw = workspaceContents[wf.filename] || "";
 
     if (raw) {
@@ -520,14 +523,14 @@ function buildIdentityText(actorId, channel, workspaceContents) {
     }
   }
 
-  const rawContents = WORKSPACE_FILES.map(
+  const rawContents = PROXY_CONTEXT_FILES.map(
     (wf) => workspaceContents[wf.filename] || "",
   );
   const fileGuide =
     "\n## Workspace File Guide\n" +
     "| File | Purpose | Status |\n" +
     "|------|---------|--------|\n" +
-    WORKSPACE_FILES.map((wf, i) => {
+    PROXY_CONTEXT_FILES.map((wf, i) => {
       const status = skippedFiles.has(wf.filename)
         ? "skipped (cap)"
         : rawContents[i]
@@ -535,7 +538,8 @@ function buildIdentityText(actorId, channel, workspaceContents) {
           : "empty";
       return `| ${wf.filename} | ${wf.purpose} | ${status} |`;
     }).join("\n") +
-    "\n| HEARTBEAT.md | scheduled check-in preferences | optional |\n";
+    "\n| Agent workspace files | AGENTS.md, SOUL.md, TOOLS.md, IDENTITY.md, MEMORY.md | available in full OpenClaw mode from the current agent workspace |\n" +
+    "| HEARTBEAT.md | scheduled check-in preferences | optional |\n";
 
   return (
     "\n\n## Current User\n" +
@@ -563,6 +567,13 @@ function buildIdentityText(actorId, channel, workspaceContents) {
 }
 
 describe("buildUserIdentityContext structure (sync subset)", () => {
+  it("preloads persona and identity files in warm-up mode", () => {
+    assert.deepEqual(
+      PROXY_CONTEXT_FILES.map((wf) => wf.filename),
+      ["AGENTS.md", "SOUL.md", "USER.md", "IDENTITY.md"],
+    );
+  });
+
   it("includes namespace protection section", () => {
     const result = buildIdentityText("slack:U0AGD41CBGS", "slack", {});
     assert.ok(result.includes("Namespace Protection (IMMUTABLE)"));
@@ -601,7 +612,7 @@ describe("buildUserIdentityContext structure (sync subset)", () => {
 });
 
 describe("Workspace: all 6 files present", () => {
-  it("renders all workspace file sections", () => {
+  it("renders warm-up workspace identity sections", () => {
     const contents = {
       "AGENTS.md": "# Rules\nBe helpful",
       "SOUL.md": "# Persona\nFriendly tone",
@@ -619,14 +630,14 @@ describe("Workspace: all 6 files present", () => {
     assert.ok(result.includes("Workspace: Agent Persona (SOUL.md)"));
     assert.ok(result.includes("Workspace: User Preferences (USER.md)"));
     assert.ok(result.includes("Workspace: Agent Identity (IDENTITY.md)"));
-    assert.ok(result.includes("Workspace: Tools Documentation (TOOLS.md)"));
-    assert.ok(result.includes("Workspace: Notes & Memories (MEMORY.md)"));
+    assert.ok(!result.includes("Workspace: Tools Documentation (TOOLS.md)"));
+    assert.ok(!result.includes("Workspace: Notes & Memories (MEMORY.md)"));
     assert.ok(result.includes("Be helpful"));
     assert.ok(result.includes("Friendly tone"));
     assert.ok(result.includes("Prefers English"));
     assert.ok(result.includes("Claw Bot"));
-    assert.ok(result.includes("Use S3 skill"));
-    assert.ok(result.includes("Remember birthdays"));
+    assert.ok(!result.includes("Use S3 skill"));
+    assert.ok(!result.includes("Remember birthdays"));
     // All should show pre-loaded in guide
     assert.ok(!result.includes("*Not yet created.*"));
   });
@@ -637,10 +648,10 @@ describe("Workspace: all files missing", () => {
     const result = buildIdentityText("telegram:123456789", "telegram", {});
     const notCreatedCount = (result.match(/\*Not yet created\.\*/g) || [])
       .length;
-    assert.equal(notCreatedCount, 6);
+    assert.equal(notCreatedCount, 4);
     // Guide should show all empty
     const emptyCount = (result.match(/\| empty \|/g) || []).length;
-    assert.equal(emptyCount, 6);
+    assert.equal(emptyCount, 4);
   });
 });
 
@@ -656,8 +667,8 @@ describe("Workspace: mixed present and missing", () => {
     // Missing files
     assert.ok(result.includes("This user has no SOUL.md"));
     assert.ok(result.includes("This user has no USER.md"));
-    assert.ok(result.includes("This user has no TOOLS.md"));
-    assert.ok(result.includes("This user has no MEMORY.md"));
+    assert.ok(!result.includes("This user has no TOOLS.md"));
+    assert.ok(!result.includes("This user has no MEMORY.md"));
   });
 });
 
@@ -705,8 +716,8 @@ describe("Workspace: sanitization", () => {
 
 describe("Workspace: total cap enforcement", () => {
   it("skips lower-priority files when total cap exceeded", () => {
-    // Each file at 4096 chars: 6 * 4096 = 24576 > 20000
-    // The last two files (TOOLS.md, MEMORY.md) should be skipped
+    // Each warm-up file at 4096 chars: 4 * 4096 = 16384 < 20000,
+    // so nothing should be skipped in the new prompt subset.
     const bigContent = "y".repeat(4096);
     const contents = {
       "AGENTS.md": bigContent,
@@ -721,33 +732,18 @@ describe("Workspace: total cap enforcement", () => {
       "telegram",
       contents,
     );
-    // TOOLS.md and MEMORY.md should have the skip marker
-    assert.ok(result.includes("*Skipped — total workspace size cap reached.*"));
-    assert.ok(
-      result.includes('read_user_file("telegram_123456789", "TOOLS.md")'),
-    );
-    assert.ok(
-      result.includes('read_user_file("telegram_123456789", "MEMORY.md")'),
-    );
-    // Higher-priority files should still be present
+    assert.ok(!result.includes("*Skipped — total workspace size cap reached.*"));
     assert.ok(result.includes("Workspace: Operating Instructions (AGENTS.md)"));
     assert.ok(result.includes("Workspace: Agent Persona (SOUL.md)"));
-    // File guide should show "skipped (cap)" for skipped files, not "pre-loaded"
-    assert.ok(
-      result.includes(
-        "| TOOLS.md | local tools and conventions documentation | skipped (cap) |",
-      ),
-    );
-    assert.ok(
-      result.includes(
-        "| MEMORY.md | freeform notes and memories | skipped (cap) |",
-      ),
-    );
+    assert.ok(result.includes("Workspace: User Preferences (USER.md)"));
+    assert.ok(result.includes("Workspace: Agent Identity (IDENTITY.md)"));
+    assert.ok(!result.includes("Workspace: Tools Documentation (TOOLS.md)"));
+    assert.ok(!result.includes("Workspace: Notes & Memories (MEMORY.md)"));
   });
 });
 
 describe("Workspace: section ordering", () => {
-  it("preserves priority order AGENTS > SOUL > USER > IDENTITY > TOOLS > MEMORY", () => {
+  it("preserves warm-up priority order AGENTS > SOUL > USER > IDENTITY", () => {
     const contents = {
       "AGENTS.md": "agents-content",
       "SOUL.md": "soul-content",
@@ -765,12 +761,10 @@ describe("Workspace: section ordering", () => {
     const soulPos = result.indexOf("Agent Persona");
     const userPos = result.indexOf("User Preferences");
     const identityPos = result.indexOf("Agent Identity");
-    const toolsPos = result.indexOf("Tools Documentation");
-    const memoryPos = result.indexOf("Notes & Memories");
     assert.ok(agentsPos < soulPos, "AGENTS before SOUL");
     assert.ok(soulPos < userPos, "SOUL before USER");
     assert.ok(userPos < identityPos, "USER before IDENTITY");
-    assert.ok(identityPos < toolsPos, "IDENTITY before TOOLS");
-    assert.ok(toolsPos < memoryPos, "TOOLS before MEMORY");
+    assert.equal(result.indexOf("Tools Documentation"), -1);
+    assert.equal(result.indexOf("Notes & Memories"), -1);
   });
 });

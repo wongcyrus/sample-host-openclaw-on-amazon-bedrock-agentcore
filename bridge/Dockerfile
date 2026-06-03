@@ -8,8 +8,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# Install AWS CLI (for Secrets Manager in entrypoint)
-RUN pip3 install --no-cache-dir --break-system-packages awscli
+# Install AWS CLI and Python dependencies for bundled robot skills
+RUN pip3 install --no-cache-dir --break-system-packages \
+    awscli \
+    boto3 \
+    requests \
+    requests-auth-aws-sigv4
 
 # Install OpenClaw and ClawHub CLI globally
 # Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
@@ -113,6 +117,7 @@ COPY dashboard-gateway.js /app/dashboard-gateway.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY workspace-files.js /app/workspace-files.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
@@ -137,6 +142,10 @@ RUN chmod +x /skills/api-keys/*.js
 # Copy AgentCore browser skill (headless Chromium browsing)
 COPY skills/agentcore-browser /skills/agentcore-browser
 RUN chmod +x /skills/agentcore-browser/*.js
+
+# Copy humanoid robot skill
+COPY skills/humanoid /skills/humanoid
+RUN chmod +x /skills/humanoid/run.sh
 
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md

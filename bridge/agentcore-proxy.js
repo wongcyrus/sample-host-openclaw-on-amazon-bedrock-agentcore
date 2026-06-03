@@ -9,6 +9,10 @@
 const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
+const {
+  PROXY_CONTEXT_FILES,
+  getWorkspaceDefaults,
+} = require("./workspace-files");
 
 const PORT = 18790;
 const AWS_REGION = process.env.AWS_REGION;
@@ -501,86 +505,15 @@ async function fetchImageFromS3(s3Key, expectedNamespace) {
   }
 }
 
-// Workspace files pre-loaded into system prompt per user (priority order)
-const WORKSPACE_FILES = [
-  {
-    filename: "AGENTS.md",
-    label: "Operating Instructions",
-    purpose: "rules, priorities, and behavioral guidelines",
-  },
-  {
-    filename: "SOUL.md",
-    label: "Agent Persona",
-    purpose: "persona, tone, and communication boundaries",
-  },
-  {
-    filename: "USER.md",
-    label: "User Preferences",
-    purpose: "user identity and communication preferences",
-  },
-  {
-    filename: "IDENTITY.md",
-    label: "Agent Identity",
-    purpose: "agent name, vibe, and emoji",
-  },
-  {
-    filename: "TOOLS.md",
-    label: "Tools Documentation",
-    purpose: "local tools and conventions documentation",
-  },
-  {
-    filename: "MEMORY.md",
-    label: "Notes & Memories",
-    purpose: "freeform notes and memories",
-  },
-];
 const WORKSPACE_PER_FILE_MAX_CHARS = 4096;
 const WORKSPACE_TOTAL_MAX_CHARS = 20000;
-
-// Default templates seeded into a user's S3 namespace on first interaction.
-// Minimal starters — users customize via write_user_file.
-const WORKSPACE_DEFAULTS = {
-  "AGENTS.md":
-    "# Operating Instructions\n\n" +
-    "- Be helpful, concise, and friendly\n" +
-    "- Keep responses appropriate for chat messaging\n" +
-    "- If you don't know something, say so honestly\n",
-  "SOUL.md":
-    "# Agent Persona\n\n" +
-    "You are a helpful personal assistant powered by OpenClaw.\n" +
-    "Tone: friendly, concise, knowledgeable.\n",
-  "USER.md":
-    "# User Preferences\n\n" +
-    "No preferences set yet. When the user shares their preferences " +
-    "(language, tone, format, interests), update this file.\n",
-  "IDENTITY.md":
-    "# Agent Identity\n\n" +
-    "No identity configured yet. When the user gives you a name, " +
-    "vibe, or emoji, update this file.\n",
-  "TOOLS.md":
-    "# Tools\n\n" +
-    "## Built-in Tools\n" +
-    "- **web_search**: Search the web for current information\n" +
-    "- **web_fetch**: Fetch and read web page content\n" +
-    "- **exec**: Run shell commands\n" +
-    "- **read**: Read local files\n\n" +
-    "## Custom Skills\n" +
-    "- **s3-user-files**: Read, write, list, and delete files in your personal workspace\n" +
-    "- **eventbridge-cron**: Schedule recurring tasks, reminders, and cron jobs\n\n" +
-    "## ClawHub Skills\n" +
-    "- **duckduckgo-search**: Web search via DuckDuckGo (no API key needed)\n" +
-    "- **jina-reader**: Extract web content as clean markdown\n" +
-    "- **deep-research-pro**: In-depth multi-step research on complex topics\n" +
-    "- **telegram-compose**: Rich HTML formatting for Telegram messages\n" +
-    "- **transcript**: YouTube video transcript extraction\n" +
-    "- **hackernews**: Browse and search Hacker News\n" +
-    "- **news-feed**: RSS-based news aggregation\n" +
-    "- **task-decomposer**: Break complex requests into manageable subtasks\n",
-  "MEMORY.md":
-    "# Notes & Memories\n\n" +
-    "No notes yet. When the user asks you to remember something, " +
-    "save it here.\n",
-};
+const MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE = (
+  process.env.MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE || ""
+).trim();
+const WORKSPACE_DEFAULTS = getWorkspaceDefaults({
+  browserEnabled: Boolean(process.env.BROWSER_IDENTIFIER),
+  humanoidEnabled: Boolean((process.env.HUMANOID_MCP_SERVER_URL || "").trim()),
+});
 
 /**
  * Sanitize workspace file content for safe system prompt injection.
@@ -611,30 +544,42 @@ async function readUserFileFromS3(namespace, filename) {
   try {
     const { GetObjectCommand } = require("@aws-sdk/client-s3");
     const s3 = getS3Client();
-    const response = await s3.send(
-      new GetObjectCommand({
-        Bucket: bucket,
-        Key: `${namespace}/${filename}`,
-      }),
-    );
-    const chunks = [];
-    for await (const chunk of response.Body) {
-      chunks.push(chunk);
+    for (const key of [
+      `${namespace}/${filename}`,
+      ...(MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE
+        ? [`${MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE}/${filename}`]
+        : []),
+    ]) {
+      try {
+        const response = await s3.send(
+          new GetObjectCommand({
+            Bucket: bucket,
+            Key: key,
+          }),
+        );
+        const chunks = [];
+        for await (const chunk of response.Body) {
+          chunks.push(chunk);
+        }
+        const content = Buffer.concat(chunks).toString("utf-8").trim();
+        console.log(
+          `[proxy] Read ${filename} for ${namespace} from ${key}: ${content.length} bytes`,
+        );
+        return content;
+      } catch (err) {
+        if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
+          continue;
+        }
+        throw err;
+      }
     }
-    const content = Buffer.concat(chunks).toString("utf-8").trim();
-    console.log(
-      `[proxy] Read ${filename} for ${namespace}: ${content.length} bytes`,
-    );
-    return content;
+    console.log(`[proxy] No ${filename} for ${namespace} (not created yet)`);
+    return "";
   } catch (err) {
-    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
-      console.log(`[proxy] No ${filename} for ${namespace} (not created yet)`);
-    } else {
-      console.warn(
-        `[proxy] Failed to read ${filename} for ${namespace}:`,
-        err.message,
-      );
-    }
+    console.warn(
+      `[proxy] Failed to read ${filename} for ${namespace}:`,
+      err.message,
+    );
     return "";
   }
 }
@@ -675,15 +620,12 @@ async function writeUserFileToS3(namespace, filename, content) {
 }
 
 /**
- * Seed missing workspace files with default templates.
- * Called fire-and-forget after reading workspace files — does not block
- * the current request. Missing files get defaults so they are available
- * on the next request.
+ * Seed missing shared user-context files with default templates.
  */
 async function ensureWorkspaceFiles(namespace, rawContents) {
   const missing = [];
-  for (let i = 0; i < WORKSPACE_FILES.length; i++) {
-    const wf = WORKSPACE_FILES[i];
+  for (let i = 0; i < PROXY_CONTEXT_FILES.length; i++) {
+    const wf = PROXY_CONTEXT_FILES[i];
     if (!rawContents[i] && WORKSPACE_DEFAULTS[wf.filename]) {
       missing.push(wf);
     }
@@ -706,7 +648,7 @@ async function ensureWorkspaceFiles(namespace, rawContents) {
 
 /**
  * Build user identity context to inject into the system prompt.
- * Pre-loads all workspace files from S3 in parallel, injects per-user
+ * Pre-loads shared user-context files from S3 in parallel, injects per-user
  * isolation rules, and enforces per-file and total size caps.
  */
 const VALID_CHANNELS = new Set([
@@ -726,9 +668,11 @@ async function buildUserIdentityContext(actorId, channel) {
   const safeChannel = VALID_CHANNELS.has(channel) ? channel : "unknown";
   const namespace = actorId.replace(/:/g, "_");
 
-  // Pre-load all workspace files in parallel
+  // Pre-load root workspace context files in parallel.
+  // In warm-up mode this is the main identity/persona source, so include
+  // AGENTS/SOUL/USER/IDENTITY directly and fall back to the shared bootstrap.
   const rawContents = await Promise.all(
-    WORKSPACE_FILES.map((wf) => readUserFileFromS3(namespace, wf.filename)),
+    PROXY_CONTEXT_FILES.map((wf) => readUserFileFromS3(namespace, wf.filename)),
   );
 
   // Fire-and-forget: seed any missing workspace files with defaults.
@@ -739,8 +683,8 @@ async function buildUserIdentityContext(actorId, channel) {
   let totalChars = 0;
   const fileSections = [];
   const skippedFiles = new Set();
-  for (let i = 0; i < WORKSPACE_FILES.length; i++) {
-    const wf = WORKSPACE_FILES[i];
+  for (let i = 0; i < PROXY_CONTEXT_FILES.length; i++) {
+    const wf = PROXY_CONTEXT_FILES[i];
     const raw = rawContents[i];
 
     if (raw) {
@@ -776,7 +720,7 @@ async function buildUserIdentityContext(actorId, channel) {
     "\n## Workspace File Guide\n" +
     "| File | Purpose | Status |\n" +
     "|------|---------|--------|\n" +
-    WORKSPACE_FILES.map((wf, i) => {
+    PROXY_CONTEXT_FILES.map((wf, i) => {
       const status = skippedFiles.has(wf.filename)
         ? "skipped (cap)"
         : rawContents[i]
@@ -784,7 +728,8 @@ async function buildUserIdentityContext(actorId, channel) {
           : "empty";
       return `| ${wf.filename} | ${wf.purpose} | ${status} |`;
     }).join("\n") +
-    "\n| HEARTBEAT.md | scheduled check-in preferences | optional |\n";
+    "\n| Agent workspace files | AGENTS.md, SOUL.md, TOOLS.md, IDENTITY.md, MEMORY.md | available in full OpenClaw mode from the current agent workspace |\n" +
+    "| HEARTBEAT.md | scheduled check-in preferences | optional |\n";
 
   return (
     "\n\n## Current User\n" +

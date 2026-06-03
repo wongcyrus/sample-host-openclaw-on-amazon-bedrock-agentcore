@@ -12,6 +12,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  WORKSPACE_FILES,
+  getWorkspaceDefaults,
+  getManagedWorkspaceS3Candidates,
+  buildAgentWorkspaceDir,
+} = require("./workspace-files");
 
 // Lazy-require AWS SDK (only available inside Docker image, not in local dev/test)
 let _s3Sdk = null;
@@ -26,7 +32,12 @@ const BUCKET = process.env.S3_USER_FILES_BUCKET;
 const LOCAL_PATH = process.env.HOME
   ? `${process.env.HOME}/.openclaw`
   : "/root/.openclaw";
+const LOCAL_WORKSPACE_PATH = path.join(LOCAL_PATH, "workspace");
+const LOCAL_WORKSPACES_ROOT = path.join(LOCAL_PATH, "workspaces");
 const WORKSPACE_PREFIX = ".openclaw";
+const MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE = (
+  process.env.MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE || ""
+).trim();
 
 // Skip patterns — files/dirs that should not be synced to S3
 const SKIP_PATTERNS = [
@@ -38,7 +49,8 @@ const SKIP_PATTERNS = [
   "package-lock.json",
   "openclaw.json",
   "AGENTS.md",
-  "workspace/AGENTS.md",
+  "workspace/",
+  "workspaces/",
   // Security: exclude files that commonly contain secrets
   ".env",
   ".secrets/",
@@ -149,6 +161,83 @@ function shouldSkip(relativePath) {
     }
   }
   return false;
+}
+
+function getWorkspaceDefaultOptions() {
+  return {
+    browserEnabled: Boolean(process.env.BROWSER_IDENTIFIER),
+    humanoidEnabled: Boolean((process.env.HUMANOID_MCP_SERVER_URL || "").trim()),
+  };
+}
+
+async function readManagedWorkspaceFile(namespace, agentId, filename) {
+  const defaults = getWorkspaceDefaults(getWorkspaceDefaultOptions(), agentId);
+  if (!BUCKET || !namespace) {
+    return defaults[filename] || "";
+  }
+
+  for (const key of getManagedWorkspaceS3Candidates({
+    namespace,
+    bootstrapNamespace: MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE,
+    agentId,
+    filename,
+  })) {
+    try {
+      const response = await getS3Client().send(
+        new (getS3Sdk().GetObjectCommand)({
+          Bucket: BUCKET,
+          Key: key,
+        }),
+      );
+      const chunks = [];
+      for await (const chunk of response.Body) {
+        chunks.push(chunk);
+      }
+      if (
+        MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE &&
+        key.startsWith(`${MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE}/`)
+      ) {
+        console.log(
+          `[workspace-sync] Using bootstrap managed workspace file: s3://${BUCKET}/${key}`,
+        );
+      }
+      return Buffer.concat(chunks).toString("utf-8");
+    } catch (err) {
+      if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  return defaults[filename] || "";
+}
+
+async function syncManagedWorkspaceFiles(namespace, agentIds = ["main"]) {
+  fs.mkdirSync(LOCAL_WORKSPACE_PATH, { recursive: true });
+  fs.mkdirSync(LOCAL_WORKSPACES_ROOT, { recursive: true });
+
+  let synced = 0;
+  const homeDir = process.env.HOME || "/root";
+  for (const agentId of agentIds) {
+    const managedDir = buildAgentWorkspaceDir(homeDir, agentId);
+    fs.mkdirSync(managedDir, { recursive: true });
+    for (const wf of WORKSPACE_FILES) {
+      const content = await readManagedWorkspaceFile(namespace, agentId, wf.filename);
+      const localFile = path.join(managedDir, wf.filename);
+      if (!content) {
+        if (fs.existsSync(localFile)) {
+          fs.rmSync(localFile, { force: true });
+        }
+        continue;
+      }
+      fs.writeFileSync(localFile, content, "utf-8");
+      synced++;
+    }
+  }
+
+  console.log(
+    `[workspace-sync] Mirrored ${synced} managed workspace file(s) across ${agentIds.length} agent workspace(s)`,
+  );
 }
 
 /**
@@ -378,6 +467,7 @@ async function cleanup(namespace) {
 module.exports = {
   restoreWorkspace,
   saveWorkspace,
+  syncManagedWorkspaceFiles,
   startPeriodicSave,
   cleanup,
   configureCredentials,

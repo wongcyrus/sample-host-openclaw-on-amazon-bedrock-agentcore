@@ -94,8 +94,10 @@ sequenceDiagram
 
     opt First message (cold start)
         AC->>AC: STS AssumeRole (scoped S3 creds)
+        AC->>AC: Prepare session storage-backed ~/.openclaw
         AC->>AC: Start proxy (~5s)
-        AC->>S3: Restore .openclaw/ (background)
+        AC->>S3: Restore .openclaw/ when session storage empty/unavailable
+        AC->>S3: Sync managed workspace files (user namespace, then bootstrap)
         AC->>AC: Start OpenClaw with scoped creds (background, ~1-2 min)
     end
 
@@ -229,6 +231,7 @@ flowchart TB
 
     S3[("S3<br/>workspace · files · images")]
     CONTRACT <-->|"restore / save<br/>.openclaw/"| S3
+    CONTRACT -->|"managed workspace<br/><namespace> then workspace-bootstrap"| S3
     SHIM -.->|"execFile<br/>skill scripts"| S3
 ```
 
@@ -299,13 +302,14 @@ gantt
     section Background
     OpenClaw starting (~1-2 min)        :crit, t3, 5s, 90s
     Workspace restore from S3           :done, t4, 1s, 10s
+    Managed workspace sync from S3      :done, t5, 2s, 8s
 
     section Full Mode
     OpenClaw ready — handoff            :milestone, m1, 90s, 0
-    Full runtime handles messages       :t5, 90s, 140s
+    Full runtime handles messages       :t6, 90s, 140s
 ```
 
-**Warm-up phase** (t=~5s to ~1-2min): Lightweight agent responds with 13 tools (web_fetch, web_search, 4 file, 4 cron, 3 skill management). All responses include `"_Warm-up mode — after full startup..._"` footer.
+**Warm-up phase** (t=~5s to ~1-2min): Lightweight agent responds with 17 tools (web_fetch, web_search, 4 file, 4 cron, 3 skill management, 4 API key tools). All responses include `"_Warm-up mode — after full startup..._"` footer.
 
 **Full mode** (t=~1-2min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
 

@@ -15,6 +15,10 @@ function agentIdFromSessionKey(key) {
   return parts[0] === "agent" ? (parts[1] || "") : "";
 }
 
+function normalizeAgentId(sessionKey) {
+  return agentIdFromSessionKey(sessionKey) || "main";
+}
+
 function extractGatewayContent(messageData) {
   if (typeof messageData === "string") {
     return messageData;
@@ -391,7 +395,7 @@ function streamGatewayEvents({
             role,
             content,
             sessionKey: payload.sessionKey,
-            agentId: agentIdFromSessionKey(payload.sessionKey),
+            agentId: normalizeAgentId(payload.sessionKey),
           });
         }
 
@@ -405,7 +409,7 @@ function streamGatewayEvents({
             type: "agent-message-final",
             runId,
             state: payload.state,
-            agentId: agentIdFromSessionKey(payload.sessionKey),
+            agentId: normalizeAgentId(payload.sessionKey),
           });
         }
         return;
@@ -414,13 +418,23 @@ function streamGatewayEvents({
       if (message.event === "agent") {
         const runId = payload.runId || "none";
         const stream = payload.stream || "unknown";
-        if (payload.data && payload.data.chunk) {
+        const streamChunk =
+          (payload.data && typeof payload.data.chunk === "string" && payload.data.chunk) ||
+          (payload.data && typeof payload.data.delta === "string" && payload.data.delta) ||
+          (
+            payload.data &&
+            typeof payload.data.text === "string" &&
+            !payload.data.delta &&
+            payload.data.text
+          ) ||
+          "";
+        if (streamChunk) {
           onEvent({
             type: "agent-stream",
             runId,
             stream,
-            chunk: payload.data.chunk,
-            agentId: agentIdFromSessionKey(payload.sessionKey),
+            chunk: streamChunk,
+            agentId: normalizeAgentId(payload.sessionKey),
           });
           return;
         }
@@ -430,7 +444,7 @@ function streamGatewayEvents({
             type: "agent-lifecycle",
             runId,
             phase: payload.data.phase,
-            agentId: agentIdFromSessionKey(payload.sessionKey),
+            agentId: normalizeAgentId(payload.sessionKey),
           });
           if (
             payload.data.phase === "end" ||

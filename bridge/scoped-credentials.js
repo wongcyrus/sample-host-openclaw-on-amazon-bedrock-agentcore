@@ -62,10 +62,30 @@ const FORWARDED_ENV_KEYS = [
  * @param {string} [opts.scheduleGroupArn] - EventBridge schedule group ARN (scopes scheduler access)
  * @returns {string} JSON policy document
  */
-function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
+function buildSessionPolicy({
+  bucket,
+  namespace,
+  actorId,
+  internalUserId,
+  cmkArn,
+  eventbridgeRoleArn,
+  identityTableArn,
+  scheduleGroupArn,
+  managedWorkspaceBootstrapNamespace,
+  region,
+  account,
+}) {
   if (!namespace || !VALID_NAMESPACE.test(namespace)) {
     throw new Error(
       `Invalid namespace "${namespace}" — must match ${VALID_NAMESPACE}`,
+    );
+  }
+  if (
+    managedWorkspaceBootstrapNamespace &&
+    !VALID_NAMESPACE.test(managedWorkspaceBootstrapNamespace)
+  ) {
+    throw new Error(
+      `Invalid managed workspace bootstrap namespace "${managedWorkspaceBootstrapNamespace}" — must match ${VALID_NAMESPACE}`,
     );
   }
 
@@ -97,12 +117,22 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
         Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
         Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
       },
+      ...(managedWorkspaceBootstrapNamespace &&
+      managedWorkspaceBootstrapNamespace !== namespace
+        ? [
+            {
+              Effect: "Allow",
+              Action: ["s3:GetObject"],
+              Resource: `arn:aws:s3:::${bucket}/${managedWorkspaceBootstrapNamespace}/*`,
+            },
+          ]
+        : []),
       {
         Effect: "Allow",
         Action: "s3:ListBucket",
         Resource: `arn:aws:s3:::${bucket}`,
       },
-      // Scheduler, DynamoDB, SecretsManager, KMS, PassRole — allowed by the
+      // Scheduler, DynamoDB, SecretsManager, KMS, Lambda URL invoke, PassRole — allowed by the
       // execution role; no further restriction needed in the session policy.
       // Application-level namespace enforcement in skill scripts provides isolation.
       {
@@ -112,6 +142,7 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
           "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
           "kms:Decrypt", "kms:GenerateDataKey",
           "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
+          "lambda:InvokeFunction", "lambda:InvokeFunctionUrl",
           "iam:PassRole",
         ],
         Resource: "*",
@@ -137,6 +168,9 @@ async function createScopedCredentials(namespace, opts = {}) {
   const cmkArn = process.env.CMK_ARN;
   const eventbridgeRoleArn = process.env.EVENTBRIDGE_ROLE_ARN;
   const region = process.env.AWS_REGION;
+  const managedWorkspaceBootstrapNamespace = (
+    process.env.MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE || ""
+  ).trim();
 
   if (!bucket) {
     throw new Error("createScopedCredentials: S3_USER_FILES_BUCKET is required");
@@ -167,7 +201,7 @@ async function createScopedCredentials(namespace, opts = {}) {
   const sessionPolicy = buildSessionPolicy({
     bucket, namespace, actorId, internalUserId: opts.internalUserId,
     cmkArn, eventbridgeRoleArn,
-    identityTableArn, scheduleGroupArn, region, account,
+    identityTableArn, scheduleGroupArn, managedWorkspaceBootstrapNamespace, region, account,
   });
 
   const commandInput = {

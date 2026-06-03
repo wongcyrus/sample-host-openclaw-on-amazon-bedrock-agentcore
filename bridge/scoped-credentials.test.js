@@ -33,6 +33,35 @@ describe("buildSessionPolicy", () => {
     assert.equal(parsed.Statement.length, 3, "should have 3 statements (S3 object, S3 list, services)");
   });
 
+  it("adds read-only bootstrap access when a bootstrap namespace is configured", () => {
+    const policy = buildSessionPolicy({
+      bucket: "my-bucket",
+      namespace: "telegram_12345",
+      managedWorkspaceBootstrapNamespace: "workspace-bootstrap",
+    });
+
+    const parsed = JSON.parse(policy);
+    const bootstrapStmt = parsed.Statement.find(
+      (s) =>
+        Array.isArray(s.Action) &&
+        s.Action.length === 1 &&
+        s.Action[0] === "s3:GetObject" &&
+        String(s.Resource).includes("/workspace-bootstrap/"),
+    );
+    assert.ok(bootstrapStmt, "should have bootstrap read-only S3 statement");
+  });
+
+  it("does not add bootstrap access when bootstrap namespace matches the user namespace", () => {
+    const policy = buildSessionPolicy({
+      bucket: "my-bucket",
+      namespace: "workspace-bootstrap",
+      managedWorkspaceBootstrapNamespace: "workspace-bootstrap",
+    });
+
+    const parsed = JSON.parse(policy);
+    assert.equal(parsed.Statement.length, 3);
+  });
+
   it("S3 object actions scoped to namespace/* only", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
@@ -127,6 +156,23 @@ describe("buildSessionPolicy", () => {
     );
     assert.ok(passRoleStmt, "should have PassRole action");
     assert.equal(passRoleStmt.Resource, "*", "PassRole resource should be wildcard");
+  });
+
+  it("includes lambda invoke permissions for function URLs in statement 1", () => {
+    const policy = buildSessionPolicy({
+      bucket: "my-bucket",
+      namespace: "telegram_12345",
+    });
+
+    const parsed = JSON.parse(policy);
+    const lambdaStmt = parsed.Statement.find(
+      (s) =>
+        Array.isArray(s.Action) &&
+        s.Action.includes("lambda:InvokeFunction") &&
+        s.Action.includes("lambda:InvokeFunctionUrl"),
+    );
+    assert.ok(lambdaStmt, "should have Lambda function URL invoke actions");
+    assert.equal(lambdaStmt.Resource, "*", "Lambda resource should be wildcard in session policy");
   });
 
   it("includes iam:PassRole even when eventbridgeRoleArn not provided", () => {
@@ -282,6 +328,7 @@ describe("createScopedCredentials", () => {
   afterEach(() => {
     delete process.env.S3_USER_FILES_BUCKET;
     delete process.env.EXECUTION_ROLE_ARN;
+    delete process.env.MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE;
   });
 
   it("calls STS AssumeRole with session policy", async () => {
@@ -359,6 +406,25 @@ describe("createScopedCredentials", () => {
 
     delete process.env.IDENTITY_TABLE_NAME;
     delete process.env.EVENTBRIDGE_SCHEDULE_GROUP;
+  });
+
+  it("includes bootstrap read access in the STS session policy when configured", async () => {
+    process.env.MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE = "workspace-bootstrap";
+
+    await createScopedCredentials("telegram_12345", {
+      stsClient: _mockStsClient,
+    });
+
+    const input = _mockStsClient.send.mock.calls[0].arguments[0].input;
+    const policy = JSON.parse(input.Policy);
+    const bootstrapStmt = policy.Statement.find(
+      (s) =>
+        Array.isArray(s.Action) &&
+        s.Action.length === 1 &&
+        s.Action[0] === "s3:GetObject" &&
+        String(s.Resource).includes("/workspace-bootstrap/"),
+    );
+    assert.ok(bootstrapStmt, "session policy should include bootstrap S3 read access");
   });
 
   it("throws when S3_USER_FILES_BUCKET is missing", async () => {

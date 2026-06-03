@@ -18,6 +18,7 @@
  */
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
@@ -29,6 +30,11 @@ const workspaceSync = require("./workspace-sync");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
+const {
+  getWorkspaceDefaultsByAgent,
+  MAIN_AGENT_ID,
+  buildAgentWorkspaceDir,
+} = require("./workspace-files");
 const {
   fetchGatewaySnapshot,
   streamGatewayEvents,
@@ -78,13 +84,15 @@ let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
 let browserHeaderRefreshTimer = null;
+let sessionStorageSyncTimer = null;
+let currentSessionStorageDir = null;
 let currentBrowserSessionId = null;
 let currentBrowserEndpoint = null;
 const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const IDENTITY_FILE = "/tmp/current-identity.json";
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
-const BUILD_VERSION = "v40"; // Bump in cdk.json to force container redeploy
+const BUILD_VERSION = "v41"; // Bump in cdk.json to force container redeploy
 
 // Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
 // The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
@@ -135,11 +143,54 @@ const DASHBOARD_DEFAULT_AGENT_ID = "main";
 
 function recordDashboardEvent(event) {
   dashboardEventSeq += 1;
-  dashboardEventBuffer.push({
+  const fullEvent = {
     ...event,
     seq: dashboardEventSeq,
     ts: Date.now(),
-  });
+  };
+
+  dashboardEventBuffer.push(fullEvent);
+
+  // Push to external dashboard if configured
+  const pushUrl = process.env.DASHBOARD_API_PUSH_URL;
+  if (pushUrl && pushUrl.startsWith("http")) {
+    try {
+      const url = new URL(pushUrl);
+      const client = url.protocol === "https:" ? https : http;
+      const payload = JSON.stringify(fullEvent);
+
+      const req = client.request(
+        {
+          hostname: url.hostname,
+          port: url.port || (url.protocol === "https:" ? 443 : 80),
+          path: url.pathname + url.search,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+          },
+          timeout: 2000, // Give up after 2 seconds
+        },
+        (res) => {
+          res.on("data", () => {}); // Consume response
+        },
+      );
+
+      req.on("timeout", () => {
+        req.destroy();
+      });
+
+      req.on("error", (err) => {
+        console.warn(`[dashboard-push] Failed to push event: ${err.message}`);
+      });
+
+      req.write(payload);
+      req.end();
+    } catch (err) {
+      console.warn(`[dashboard-push] URL parse error: ${err.message}`);
+    }
+  }
+
   if (dashboardEventBuffer.length > DASHBOARD_EVENT_BUFFER_LIMIT) {
     dashboardEventBuffer = dashboardEventBuffer.slice(
       -DASHBOARD_EVENT_BUFFER_LIMIT,
@@ -236,39 +287,71 @@ function emitSyntheticDashboardResponse(runId, responseText, phase = "end") {
  * can pick up cross-channel identity changes (the proxy's env vars are
  * fixed at spawn time and cannot be updated for a running child process).
  */
-/**
- * Set up symlink from ~/.openclaw to session storage mount.
- * Returns true if session storage is available and symlink was created.
- */
-function setupSessionStorageSymlink() {
+function clearDirectoryContents(dir) {
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    return;
+  }
+  for (const entry of fs.readdirSync(dir)) {
+    fs.rmSync(`${dir}/${entry}`, { recursive: true, force: true });
+  }
+}
+
+function copyDirectoryContents(srcDir, dstDir) {
+  if (!fs.existsSync(srcDir) || !fs.statSync(srcDir).isDirectory()) {
+    return;
+  }
+  fs.mkdirSync(dstDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir)) {
+    fs.cpSync(`${srcDir}/${entry}`, `${dstDir}/${entry}`, {
+      recursive: true,
+      force: true,
+      preserveTimestamps: true,
+    });
+  }
+}
+
+function syncWorkspaceToSessionStorage() {
+  if (!currentSessionStorageDir) {
+    return;
+  }
   try {
-    // Check if session storage mount exists (only available during invocation)
-    if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
-      console.log("[contract] Session storage not available at", SESSION_STORAGE_MOUNT);
-      return false;
-    }
+    fs.mkdirSync(currentSessionStorageDir, { recursive: true });
+    clearDirectoryContents(currentSessionStorageDir);
+    copyDirectoryContents(OPENCLAW_DIR, currentSessionStorageDir);
+    console.log(`[contract] Session storage synced from ${OPENCLAW_DIR} to ${currentSessionStorageDir}`);
+  } catch (err) {
+    console.warn(`[contract] Session storage sync failed: ${err.message}`);
+  }
+}
 
-    const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-    fs.mkdirSync(mountedDir, { recursive: true });
+function startSessionStorageSync() {
+  if (!currentSessionStorageDir) {
+    return;
+  }
+  const interval = parseInt(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000", 10);
+  if (sessionStorageSyncTimer) {
+    clearInterval(sessionStorageSyncTimer);
+  }
+  sessionStorageSyncTimer = setInterval(() => {
+    syncWorkspaceToSessionStorage();
+  }, interval);
+  console.log(`[contract] Session storage sync started (every ${interval / 1000}s)`);
+}
 
-    // Check existing .openclaw — may be a symlink, directory, or missing
-    let existingType = null;
+/**
+ * Prepare a real ~/.openclaw directory while using session storage as a source/backup.
+ * Returns session storage metadata when the mount is available.
+ */
+function prepareSessionStorageWorkspace() {
+  try {
+    let existingType = "missing";
     try {
       const stat = fs.lstatSync(OPENCLAW_DIR);
       if (stat.isSymbolicLink()) {
-        const target = fs.readlinkSync(OPENCLAW_DIR);
-        if (target === mountedDir) {
-          console.log("[contract] Session storage symlink already in place");
-          return true;
-        }
         existingType = "symlink";
         fs.unlinkSync(OPENCLAW_DIR);
       } else if (stat.isDirectory()) {
         existingType = "directory";
-        // Copy contents to session storage (cross-device, can't use rename)
-        const { execSync } = require("child_process");
-        execSync(`cp -a ${OPENCLAW_DIR}/. ${mountedDir}/ 2>/dev/null || true`);
-        fs.rmSync(OPENCLAW_DIR, { recursive: true, force: true });
       } else {
         existingType = "file";
         fs.unlinkSync(OPENCLAW_DIR);
@@ -276,13 +359,43 @@ function setupSessionStorageSymlink() {
     } catch {
       // OPENCLAW_DIR doesn't exist yet — that's fine
     }
+    fs.mkdirSync(OPENCLAW_DIR, { recursive: true });
 
-    fs.symlinkSync(mountedDir, OPENCLAW_DIR);
-    console.log(`[contract] Session storage symlink: ${OPENCLAW_DIR} -> ${mountedDir} (was: ${existingType || "missing"})`);
-    return true;
+    // Check if session storage mount exists (only available during invocation)
+    if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
+      console.log("[contract] Session storage not available at", SESSION_STORAGE_MOUNT);
+      currentSessionStorageDir = null;
+      return { available: false, mountedDir: null, hasContent: false };
+    }
+
+    const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
+    fs.mkdirSync(mountedDir, { recursive: true });
+    currentSessionStorageDir = mountedDir;
+
+    let hasContent = false;
+    try {
+      hasContent = fs.readdirSync(mountedDir).length > 0;
+    } catch {
+      hasContent = false;
+    }
+
+    if (hasContent) {
+      clearDirectoryContents(OPENCLAW_DIR);
+      copyDirectoryContents(mountedDir, OPENCLAW_DIR);
+      console.log(
+        `[contract] Restored real workspace dir from session storage: ${mountedDir} -> ${OPENCLAW_DIR} (was: ${existingType})`,
+      );
+    } else {
+      console.log(
+        `[contract] Session storage available at ${mountedDir}; using real workspace dir ${OPENCLAW_DIR} (was: ${existingType})`,
+      );
+    }
+
+    return { available: true, mountedDir, hasContent };
   } catch (err) {
     console.warn(`[contract] Session storage setup failed: ${err.message}`);
-    return false;
+    currentSessionStorageDir = null;
+    return { available: false, mountedDir: null, hasContent: false };
   }
 }
 
@@ -583,6 +696,15 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
 // Distinct subagent model name — proxy uses this to detect and route subagent requests.
 // Must match the SUBAGENT_MODEL_NAME env var passed to the proxy.
 const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
+const PRIMARY_MODEL = "agentcore/bedrock-agentcore";
+const HUMANOID_ROBOT_IDS = [
+  "robot_1",
+  "robot_2",
+  "robot_3",
+  "robot_4",
+  "robot_5",
+  "robot_6",
+];
 
 /**
  * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
@@ -591,11 +713,57 @@ const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
  * Sandbox disabled — AgentCore microVMs provide per-user isolation.
  */
 function writeOpenClawConfig() {
-  const fs = require("fs");
-
+  const homeDir = process.env.HOME || "/root";
   // Sub-agent model uses a distinct name so the proxy can identify subagent requests.
   // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
   const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
+  const humanoidMcpUrl = (process.env.HUMANOID_MCP_SERVER_URL || "").trim();
+  const humanoidAuthMode = (process.env.HUMANOID_MCP_AUTH_MODE || "iam").trim().toLowerCase();
+  const humanoidApiKeyHeader = (process.env.HUMANOID_MCP_API_KEY_HEADER || "x-api-key").trim();
+  const humanoidEnabled = humanoidMcpUrl.length > 0;
+  const mainWorkspaceDir = buildAgentWorkspaceDir(homeDir, MAIN_AGENT_ID);
+  const mainAgent = {
+    id: "main",
+    name: "Main",
+    model: PRIMARY_MODEL,
+    identity: { name: "Main" },
+    workspace: mainWorkspaceDir,
+  };
+
+  if (humanoidEnabled) {
+    mainAgent.subagents = { allowAgents: HUMANOID_ROBOT_IDS };
+  }
+
+  const robotAgents = humanoidEnabled
+    ? HUMANOID_ROBOT_IDS.map((robotId, index) => ({
+      id: robotId,
+      name: `Robot ${index + 1}`,
+      model: PRIMARY_MODEL,
+      skills: ["humanoid"],
+      identity: { name: `Robot ${index + 1}` },
+      workspace: buildAgentWorkspaceDir(homeDir, robotId),
+      tools: {
+        profile: "full",
+        deny: [
+          "tts",
+          "image",
+          "image_generate",
+          "music_generate",
+          "video_generate",
+          "browser",
+          "canvas",
+          "web_search",
+          "web_fetch",
+          "subagents",
+        ],
+        exec: {
+          host: "gateway",
+          security: "full",
+          ask: "off",
+        },
+      },
+    }))
+    : [];
 
   const config = {
     models: {
@@ -613,7 +781,8 @@ function writeOpenClawConfig() {
     },
     agents: {
       defaults: {
-        model: { primary: "agentcore/bedrock-agentcore" },
+        model: { primary: PRIMARY_MODEL },
+        workspace: mainWorkspaceDir,
         subagents: {
           model: subagentModel,
           maxConcurrent: 2,
@@ -624,6 +793,7 @@ function writeOpenClawConfig() {
           mode: "off", // No Docker in AgentCore container; microVMs provide isolation
         },
       },
+      list: [mainAgent, ...robotAgents],
     },
     tools: {
       profile: "full",
@@ -649,6 +819,19 @@ function writeOpenClawConfig() {
     skills: {
       allowBundled: [],
       load: { extraDirs: ["/skills"] },
+      entries: humanoidEnabled
+        ? {
+          humanoid: {
+            enabled: true,
+            env: {
+              MCP_SERVER_URL: humanoidMcpUrl,
+              MCP_AUTH_MODE: humanoidAuthMode,
+              MCP_API_KEY_HEADER: humanoidApiKeyHeader,
+              AWS_REGION: process.env.AWS_REGION || "us-east-1",
+            },
+          },
+        }
+        : {},
     },
     gateway: {
       mode: "local",
@@ -666,155 +849,35 @@ function writeOpenClawConfig() {
     channels: {}, // No channels — messages bridged via WebSocket
   };
 
-  const homeDir = process.env.HOME || "/root";
   fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
+  fs.mkdirSync(mainWorkspaceDir, { recursive: true });
   fs.writeFileSync(
     `${homeDir}/.openclaw/openclaw.json`,
     JSON.stringify(config, null, 2),
   );
   console.log("[contract] OpenClaw headless config written");
-
-  // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Always overwrite to ensure instructions match the current container version
-  // (workspace restore from S3 may carry stale AGENTS.md without new features like browser).
-  const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
-  {
-    fs.writeFileSync(
-      agentsMdPath,
-      [
-        "# Agent Instructions",
-        "",
-        "You are a helpful AI assistant running in a per-user container on AWS.",
-        "You have built-in web tools, file storage, scheduling, and many community skills.",
-        "",
-        "## Response Formatting",
-        "",
-        "Format responses for chat messaging apps (Telegram, Slack):",
-        "- **No markdown tables** — use bullet lists or plain text paragraphs instead",
-        "- Tables do not render in most chat apps; bullets always work",
-        "- Keep responses concise and chat-appropriate",
-        "",
-        "## Built-in Web Tools",
-        "",
-        "You have built-in **web_search** and **web_fetch** tools:",
-        "- **web_search**: Search the web for current information",
-        "- **web_fetch**: Fetch and read web page content as markdown",
-        "",
-        "Use these for real-time information, news, research, and reading web pages.",
-        "",
-        "## Scheduling & Cron Jobs",
-        "",
-        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to set up reminders,",
-        "recurring tasks, or cron jobs, use these commands via Bash. Do NOT say cron is disabled.",
-        "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
-        "",
-        "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
-        "",
-        "**Commands** (run via Bash):",
-        "- Create: `node /skills/eventbridge-cron/create.js <user_id> <cron_expression> <timezone> <message> [channel] [channel_target] [schedule_name]`",
-        "- List: `node /skills/eventbridge-cron/list.js <user_id>`",
-        "- Update: `node /skills/eventbridge-cron/update.js <user_id> <schedule_id> [--expression \"cron(...)\"] [--timezone \"TZ\"] [--message \"msg\"] [--enable] [--disable]`",
-        "- Delete: `node /skills/eventbridge-cron/delete.js <user_id> <schedule_id>`",
-        "",
-        "Cron format: `cron(min hour day-of-month month day-of-week year)` — e.g., `cron(0 9 * * ? *)` for daily at 9 AM.",
-        "Rate format: `rate(1 hour)`, `rate(5 minutes)`.",
-        "",
-        "## File Storage",
-        "",
-        "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
-        "",
-        "## Community Skills (ClawHub)",
-        "",
-        "The following community skills are pre-installed:",
-        "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
-        "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
-        "- **telegram-compose**: Rich HTML formatting for Telegram messages",
-        "- **transcript**: YouTube video transcript extraction",
-        "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
-        "",
-        "### Installing More Skills",
-        "",
-        "You have the **clawhub-manage** skill to install/uninstall additional community skills from the ClawHub marketplace.",
-        "When a user asks to install or add a skill, use this skill — do NOT say it's not possible or that exec is blocked.",
-        "**Use Bash to run the skill scripts** (Bash is available, only exec is denied):",
-        "- Install: `node /skills/clawhub-manage/install.js <skill-name>`",
-        "- Uninstall: `node /skills/clawhub-manage/uninstall.js <skill-name>`",
-        "- List: `node /skills/clawhub-manage/list.js`",
-        "",
-        "After install/uninstall, the skill will be available on the next session start (after idle timeout or new conversation).",
-        "",
-        "## API Key Storage",
-        "",
-        "You have the **api-keys** skill for secure API key storage.",
-        "",
-        "### Proactive Detection",
-        "",
-        "If a user message contains what looks like an API key or secret token — even without explicitly asking to save it — you MUST proactively offer to store it securely. Common patterns:",
-        "- `sk-...`, `sk-proj-...` (OpenAI)",
-        "- `key-...`, `pk-...` (generic)",
-        "- `ghp_...`, `gho_...` (GitHub)",
-        "- `xoxb-...`, `xoxp-...` (Slack)",
-        "- `AKIA...` (AWS access key)",
-        "- Any long alphanumeric string (20+ chars) that the user labels as a key, token, or secret",
-        "",
-        "When detected, say something like: *\"That looks like an API key. Let me store it securely so you don't lose it. I'll use Secrets Manager (recommended) — OK?\"* Then store it immediately using Secrets Manager unless the user prefers native storage. Infer the key name from context (e.g., `openai_api_key`, `github_token`).",
-        "",
-        "### Storage Options",
-        "",
-        "When a user explicitly asks to save an API key, present both options:",
-        "",
-        "**Option 1 — Native (file-based)**:",
-        "- `node /skills/api-keys/native.js <user_id> set <key_name> <key_value>`",
-        "- Stored in your workspace file, persists across sessions via S3 sync",
-        "- KMS-encrypted at rest in S3, isolated to your user namespace",
-        "",
-        "**Option 2 — Secure (AWS Secrets Manager)** (recommended):",
-        "- `node /skills/api-keys/secret.js <user_id> set <key_name> <key_value>`",
-        "- Stored in AWS Secrets Manager, KMS-encrypted, auditable via CloudTrail",
-        "- NOT stored in workspace files — stronger isolation",
-        "",
-        "**Unified retrieval** (checks SM first, falls back to native):",
-        "- `node /skills/api-keys/retrieve.js <user_id> <key_name>`",
-        "",
-        "**Migration** between backends:",
-        "- `node /skills/api-keys/migrate.js <user_id> <key_name> native-to-secure`",
-        "- `node /skills/api-keys/migrate.js <user_id> <key_name> secure-to-native`",
-        "",
-        "Actions for both native.js and secret.js: `set`, `get`, `list`, `delete`",
-        "",
-        "**Important**: The `<user_id>` is your namespace (e.g. `telegram_12345`). Never write API keys to regular user files (s3-user-files). Always use the api-keys skill.",
-        "",
-        ...(process.env.BROWSER_IDENTIFIER
-          ? [
-              "## Browser (AgentCore Browser)",
-              "",
-              "You have the **agentcore-browser** skill for headless Chromium browsing. Use it when users ask to:",
-              "- Visit or navigate to a web page",
-              "- Take a screenshot of a website",
-              "- Interact with page elements (click buttons, fill forms, scroll)",
-              "",
-              "**Commands** (run via Bash):",
-              '- Navigate: `node /skills/agentcore-browser/navigate.js \'{"url": "https://example.com"}\'`',
-              '- Screenshot: `node /skills/agentcore-browser/screenshot.js \'{"description": "Page screenshot"}\'`',
-              '- Click: `node /skills/agentcore-browser/interact.js \'{"action": "click", "selector": "#btn"}\'`',
-              '- Type: `node /skills/agentcore-browser/interact.js \'{"action": "type", "selector": "#input", "text": "hello"}\'`',
-              '- Scroll: `node /skills/agentcore-browser/interact.js \'{"action": "scroll"}\'`',
-              '- Wait: `node /skills/agentcore-browser/interact.js \'{"action": "wait", "selector": ".results"}\'`',
-              "",
-              "Screenshots are uploaded to S3 and delivered as images to the user's chat.",
-              "The browser session is pre-created at startup — no setup needed.",
-              "",
-            ]
-          : []),
-        "## Sub-agents",
-        "",
-        "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
-        "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
-        "",
-      ].join("\n"),
-    );
-    console.log("[contract] AGENTS.md written");
+  const managedAgentIds = [MAIN_AGENT_ID, ...robotAgents.map((agentDef) => agentDef.id)];
+  const workspaceDefaultsByAgent = getWorkspaceDefaultsByAgent(
+    {
+      browserEnabled: Boolean(process.env.BROWSER_IDENTIFIER),
+      humanoidEnabled: Boolean((process.env.HUMANOID_MCP_SERVER_URL || "").trim()),
+    },
+    managedAgentIds,
+  );
+  for (const agentId of managedAgentIds) {
+    const workspaceDir = buildAgentWorkspaceDir(homeDir, agentId);
+    const workspaceDefaults = workspaceDefaultsByAgent[agentId];
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    for (const [filename, content] of Object.entries(workspaceDefaults)) {
+      const localFile = `${workspaceDir}/${filename}`;
+      if (!fs.existsSync(localFile)) {
+        fs.writeFileSync(localFile, content, "utf-8");
+      }
+    }
   }
+  console.log(
+    `[contract] OpenClaw workspace defaults prepared for ${managedAgentIds.join(", ")}`,
+  );
 }
 
 /**
@@ -827,6 +890,7 @@ async function pollOpenClawReadiness(namespace) {
     openclawReady = true;
     startDashboardEventStream();
     workspaceSync.startPeriodicSave(namespace);
+    startSessionStorageSync();
     console.log(
       "[contract] OpenClaw ready — switching from lightweight agent to full OpenClaw",
     );
@@ -1117,41 +1181,88 @@ async function init(userId, actorId, channel) {
       console.warn(`[contract] Lock cleanup failed: ${err.message}`);
     });
 
-    // 2. Start the Bedrock proxy with user identity env vars
-    // Only pass required env vars — avoid leaking secrets via process.env spread
-    console.log("[contract] Starting Bedrock proxy...");
-    const proxyEnv = {
-      PATH: process.env.PATH,
-      HOME: process.env.HOME || "/root",
-      NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
-      NODE_OPTIONS: process.env.NODE_OPTIONS || "",
-      AWS_REGION: process.env.AWS_REGION || "us-west-2",
-      BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
-      COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
-      COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-      COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
-      S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
-      SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
-      SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
-      USER_ID: actorId,
-      INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
-      CHANNEL: channel,
-      OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
-    };
-    proxyProcess = spawn("node", ["/app/agentcore-proxy.js"], {
-      env: proxyEnv,
-      stdio: ["inherit", "pipe", "pipe"],
-    });
-    proxyProcess.stdout.on("data", (d) => {
-      d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
-    });
-    proxyProcess.stderr.on("data", (d) => {
-      d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
-    });
-    proxyProcess.on("exit", (code) => {
-      console.log(`[contract] Proxy exited with code ${code}`);
-      proxyReady = false;
-    });
+    // 2. Start the Bedrock proxy with user identity env vars.
+    // Reuse an already-listening proxy instead of racing into EADDRINUSE.
+    const existingProxyReady = await waitForPort(PROXY_PORT, "Proxy", 2000, 250);
+    if (existingProxyReady) {
+      proxyReady = true;
+      console.log("[contract] Reusing existing Bedrock proxy on port 18790");
+    } else {
+      console.log("[contract] Starting Bedrock proxy...");
+      const proxyEnv = {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME || "/root",
+        NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
+        NODE_OPTIONS: process.env.NODE_OPTIONS || "",
+        AWS_REGION: process.env.AWS_REGION || "us-west-2",
+        BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
+        COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
+        COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
+        COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
+        S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
+        SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
+        SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
+        USER_ID: actorId,
+        INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
+        CHANNEL: channel,
+        OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
+      };
+      const spawnedProxy = spawn("node", ["/app/agentcore-proxy.js"], {
+        env: proxyEnv,
+        stdio: ["inherit", "pipe", "pipe"],
+      });
+      proxyProcess = spawnedProxy;
+      spawnedProxy.stdout.on("data", (d) => {
+        d.toString().split("\n").filter(Boolean).forEach(line => console.log(`[proxy:out] ${line}`));
+      });
+      spawnedProxy.stderr.on("data", (d) => {
+        d.toString().split("\n").filter(Boolean).forEach(line => console.error(`[proxy:err] ${line}`));
+      });
+      spawnedProxy.on("exit", (code) => {
+        console.log(`[contract] Proxy exited with code ${code}`);
+        if (proxyProcess === spawnedProxy) {
+          proxyProcess = null;
+          proxyReady = false;
+        }
+      });
+    }
+
+    // Session storage: restore into a real ~/.openclaw directory if available
+    const sessionStorage = prepareSessionStorageWorkspace();
+    const sessionStorageAvailable = sessionStorage.available;
+
+    // Restore workspace from S3 if session storage is empty or unavailable
+    if (sessionStorageAvailable) {
+      if (sessionStorage.hasContent) {
+        console.log("[contract] Session storage has existing data — skipping S3 restore");
+      } else {
+        console.log("[contract] Session storage is empty — restoring from S3 backup");
+        workspaceSync.restoreWorkspace(namespace).catch((err) => {
+          console.warn(`[contract] Workspace restore failed: ${err.message}`);
+        }).finally(() => {
+          syncWorkspaceToSessionStorage();
+        });
+      }
+    } else {
+      // No session storage — use S3 sync as primary (existing behavior)
+      workspaceSync.restoreWorkspace(namespace).catch((err) => {
+        console.warn(`[contract] Workspace restore failed: ${err.message}`);
+      });
+    }
+
+    try {
+      await workspaceSync.syncManagedWorkspaceFiles(
+        namespace,
+        (process.env.HUMANOID_MCP_SERVER_URL || "").trim()
+          ? [MAIN_AGENT_ID, ...HUMANOID_ROBOT_IDS]
+          : [MAIN_AGENT_ID],
+      );
+    } catch (err) {
+      console.warn(`[contract] Managed workspace sync failed: ${err.message}`);
+    }
+    if (sessionStorageAvailable) {
+      syncWorkspaceToSessionStorage();
+    }
 
     // Wait for lock cleanup to complete before starting OpenClaw
     await lockCleanupPromise;
@@ -1217,34 +1328,6 @@ async function init(userId, actorId, channel) {
       updateDashboardEventStatus("disconnected", { exitCode: code });
       scheduleOpenClawRestart(currentNamespace);
     });
-
-    // Session storage: symlink .openclaw → /mnt/workspace/.openclaw if available
-    const sessionStorageAvailable = setupSessionStorageSymlink();
-
-    // Restore workspace from S3 if session storage is empty or unavailable
-    if (sessionStorageAvailable) {
-      // Check if session storage .openclaw dir has content (non-empty = resumed session)
-      const mountedOpenclawDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
-      let hasContent = false;
-      try {
-        const entries = fs.readdirSync(mountedOpenclawDir);
-        hasContent = entries.length > 0;
-      } catch { /* dir doesn't exist yet */ }
-
-      if (hasContent) {
-        console.log("[contract] Session storage has existing data — skipping S3 restore");
-      } else {
-        console.log("[contract] Session storage is empty — restoring from S3 backup");
-        workspaceSync.restoreWorkspace(namespace).catch((err) => {
-          console.warn(`[contract] Workspace restore failed: ${err.message}`);
-        });
-      }
-    } else {
-      // No session storage — use S3 sync as primary (existing behavior)
-      workspaceSync.restoreWorkspace(namespace).catch((err) => {
-        console.warn(`[contract] Workspace restore failed: ${err.message}`);
-      });
-    }
 
     // 2. Wait only for proxy readiness (~5s)
     proxyReady = await waitForPort(PROXY_PORT, "Proxy", 30000, 1000);
@@ -1379,8 +1462,6 @@ function extractTextFromContent(content) {
 // ---------------------------------------------------------------------------
 // Telegram progressive streaming helpers
 // ---------------------------------------------------------------------------
-
-const https = require("https");
 
 /**
  * Call the Telegram Bot API. Returns parsed JSON response.
@@ -1585,7 +1666,6 @@ async function bridgeMessage(
 
     ws.on("message", (data) => {
       const raw = data.toString();
-      console.log(`[contract] WS rx: ${raw.slice(0, 500)}`);
       let msg;
       try {
         msg = JSON.parse(raw);
@@ -1593,6 +1673,13 @@ async function bridgeMessage(
         console.log(`[contract] WS parse error: ${e.message}`);
         return;
       }
+      const summaryBits = [`type=${msg.type || "unknown"}`];
+      if (msg.event) summaryBits.push(`event=${msg.event}`);
+      if (msg.id) summaryBits.push(`id=${msg.id}`);
+      if (msg.payload?.runId) summaryBits.push(`run=${msg.payload.runId}`);
+      if (msg.payload?.sessionKey) summaryBits.push(`session=${msg.payload.sessionKey}`);
+      if (msg.payload?.state) summaryBits.push(`state=${msg.payload.state}`);
+      console.log(`[contract] WS rx ${summaryBits.join(" ")}`);
 
       // Step 1: Server sends connect.challenge event -> client sends connect request
       if (msg.type === "event" && msg.event === "connect.challenge") {
@@ -2451,6 +2538,10 @@ process.on("SIGTERM", async () => {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
   }
+  if (sessionStorageSyncTimer) {
+    clearInterval(sessionStorageSyncTimer);
+    sessionStorageSyncTimer = null;
+  }
   if (browserHeaderRefreshTimer) {
     clearInterval(browserHeaderRefreshTimer);
     browserHeaderRefreshTimer = null;
@@ -2463,6 +2554,7 @@ process.on("SIGTERM", async () => {
   }, 10000);
 
   try {
+    syncWorkspaceToSessionStorage();
     await workspaceSync.cleanup(currentNamespace);
   } catch (err) {
     console.warn(`[contract] Workspace cleanup error: ${err.message}`);

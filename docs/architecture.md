@@ -140,11 +140,13 @@
          |
          v
   First /invocations {action: "chat"}:
-    1. Restore .openclaw/ from S3  (workspace-sync.js)
-    2. Start agentcore-proxy.js (port 18790) with USER_ID env
-    3. Write headless OpenClaw config (no channels)
-    4. Start OpenClaw gateway (port 18789, ~4 min startup)
-    5. Start periodic workspace saves (every 5 min)
+    1. Prepare session storage-backed ~/.openclaw (or fall back to S3 primary sync)
+    2. Restore .openclaw/ from S3 only when session storage is empty/unavailable
+    3. Sync managed workspace files from S3 (`<namespace>/...`, fallback `workspace-bootstrap/...`)
+    4. Start agentcore-proxy.js (port 18790) with USER_ID env
+    5. Write headless OpenClaw config (no channels)
+    6. Start OpenClaw gateway (port 18789, ~1-2 min startup)
+    7. Start periodic workspace saves (every 5 min; 30 min in backup mode)
          |
          v
   WebSocket bridge: auth -> chat.send -> streaming deltas -> final
@@ -182,11 +184,13 @@
 |    |                                                                  |
 |    |-- On first chat (lazy init):                                    |
 |    |   1. Fetch secrets from Secrets Manager                         |
-|    |   2. Restore .openclaw/ from S3 (workspace-sync.js)             |
-|    |   3. Start agentcore-proxy.js (port 18790)                      |
-|    |   4. Write headless OpenClaw config (no channels)               |
-|    |   5. Start OpenClaw gateway (port 18789) — ~4 min startup       |
-|    |   6. Start periodic workspace saves                              |
+|    |   2. Prepare session storage-backed ~/.openclaw                 |
+|    |   3. Restore .openclaw/ from S3 only when session storage is empty/unavailable |
+|    |   4. Sync managed workspace files from S3 (user namespace, then shared bootstrap) |
+|    |   5. Start agentcore-proxy.js (port 18790)                      |
+|    |   6. Write headless OpenClaw config (no channels)               |
+|    |   7. Start OpenClaw gateway (port 18789) — ~1-2 min startup     |
+|    |   8. Start periodic workspace saves                              |
 |    |                                                                  |
 |    |-- On subsequent chats:                                          |
 |    |   WebSocket bridge to OpenClaw:                                 |

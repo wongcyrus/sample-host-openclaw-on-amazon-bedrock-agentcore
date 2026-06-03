@@ -176,7 +176,7 @@ openclaw-on-agentcore/
 |---|---|---|
 | **OpenClawVpc** | VPC (2 AZ), subnets, NAT, 7 VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (8 secrets incl. webhook validation + feishu), Cognito User Pool, optional CloudTrail | None |
-| **OpenClawAgentCore** | Execution Role, Security Group, S3 bucket (Runtime/Endpoint managed by Starter Toolkit) | Vpc, Security |
+| **OpenClawAgentCore** | Execution Role, Security Group, user-files S3 bucket, managed-workspace bootstrap deployment, Runtime, Endpoint, optional Browser | Vpc, Security |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms, SNS, Bedrock invocation logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -184,15 +184,15 @@ openclaw-on-agentcore/
 
 ## Expected Commands
 
-### Hybrid Deploy (CDK + Starter Toolkit)
+### CDK Deploy
 
-Deployment uses a 3-phase hybrid model: CDK for infrastructure, Starter Toolkit for Runtime/container.
+Deployment uses a 3-phase **CDK-only** flow. The `OpenClawAgentCore` stack now owns the container asset build/publish, the managed-workspace bootstrap `BucketDeployment`, the AgentCore Runtime, and the Runtime Endpoint.
 
 ```bash
 # Full deploy via script (recommended)
 ./scripts/deploy.sh                  # all 3 phases
 ./scripts/deploy.sh --phase1         # CDK foundation only
-./scripts/deploy.sh --runtime-only   # Starter Toolkit only
+./scripts/deploy.sh --runtime-only   # CDK AgentCore runtime phase only
 ./scripts/deploy.sh --phase3         # CDK dependent stacks only
 ```
 
@@ -201,24 +201,15 @@ Deployment uses a 3-phase hybrid model: CDK for infrastructure, Starter Toolkit 
 source .venv/bin/activate
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export CDK_DEFAULT_REGION=us-west-2
-cdk deploy OpenClawVpc OpenClawSecurity OpenClawAgentCore OpenClawObservability --require-approval never
+cdk deploy OpenClawVpc OpenClawSecurity OpenClawGuardrails OpenClawObservability --require-approval never
 ```
 
-#### Phase 2: Starter Toolkit (Runtime + Docker build)
+#### Phase 2: CDK AgentCore runtime stack
 ```bash
-# Configure (first time only)
-agentcore configure --name openclaw_agent --entrypoint bridge/agentcore-contract.js \
-  --execution-role <ROLE_ARN> --region us-west-2 --vpc \
-  --subnets <SUBNET_IDS> --security-groups <SG_ID> \
-  --deployment-type container --language typescript --non-interactive
-
-# Deploy (builds Docker image locally or via CodeBuild, creates/updates Runtime)
-agentcore deploy --agent openclaw_agent --local-build --auto-update-on-conflict \
-  --env "BEDROCK_MODEL_ID=global.anthropic.claude-opus-4-6-v1" \
-  --env "S3_USER_FILES_BUCKET=openclaw-user-files-..." ...
-
-# Update cdk.json with runtime_id and runtime_endpoint_id from toolkit output
+cdk deploy OpenClawAgentCore --require-approval never
 ```
+
+This phase builds/publishes the container asset, uploads `bootstrap/managed-workspace/` to the shared bootstrap S3 prefix, and only then creates/updates the runtime and endpoint.
 
 #### Phase 3: CDK dependent stacks
 ```bash
@@ -229,8 +220,7 @@ cdk deploy OpenClawRouter OpenClawCron OpenClawTokenMonitoring --require-approva
 ```bash
 cdk synth                                    # synthesize + cdk-nag checks
 cdk diff                                     # preview changes
-cdk destroy --all                            # tear down (does NOT destroy Starter Toolkit resources)
-agentcore destroy --agent openclaw_agent     # destroy Starter Toolkit resources
+cdk destroy --all                            # tear down all CDK-managed resources
 ```
 
 ### Webhook Setup (Telegram)
@@ -526,10 +516,11 @@ sudo docker push $ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/bedrock-agen
    - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
    - Create STS scoped credentials restricting S3 + Secrets Manager + DynamoDB to user's namespace
    - Configure workspace-sync with scoped credentials
+   - Prepare the real `~/.openclaw` directory and bind it to session storage when `/mnt/workspace` is available
+   - If session storage is empty or unavailable: restore `.openclaw/` from S3 via `workspace-sync.js`
+   - Sync managed workspace files from S3 using the user's namespace first, then the shared bootstrap namespace (`managed_workspace_bootstrap_namespace`, default `workspace-bootstrap`)
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
    - Start OpenClaw gateway (port 18789) with scoped credentials env (no container credentials)
-   - Set up session storage symlink (`~/.openclaw` → `/mnt/workspace/.openclaw`)
-   - If session storage empty: restore `.openclaw/` from S3 via `workspace-sync.js`
    - Start credential refresh timer (45 min interval)
    - If `BROWSER_IDENTIFIER` set: create browser session via AgentCore Browser API, write session file to `/tmp/agentcore-browser-session.json`
    - Wait for proxy only (~5s)
@@ -610,7 +601,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 ## Gotchas
 
 ### AgentCore Runtime
-- **Hybrid deploy**: Runtime/Endpoint/ECR managed by Starter Toolkit (`agentcore deploy`), not CDK. CDK manages IAM Role, SG, S3, Lambda, etc. See `./scripts/deploy.sh` for the 3-phase flow
+- **CDK deploy**: Runtime/Endpoint/ECR asset publishing are managed by the `OpenClawAgentCore` CDK stack. `./scripts/deploy.sh` still runs in 3 phases, but all phases are CDK-driven.
 - **ARM64 required**: Build with `--platform linux/arm64`. This machine is ARM64 native — use `--local-build` mode
 - **Docker Hub rate limit**: Dockerfile uses `public.ecr.aws/docker/library/node:22-slim` (ECR Public Gallery) instead of Docker Hub to avoid anonymous pull rate limits in CodeBuild
 - **IAM role names are region-suffixed**: `openclaw-agentcore-execution-role-{region}` and `openclaw-cron-scheduler-role-{region}` to avoid cross-region conflicts (IAM roles are global)
@@ -683,9 +674,10 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 
 ### Workspace Persistence (Session Storage + S3 Backup)
 - **Primary**: AgentCore Session Storage — service-managed persistent filesystem mounted at `/mnt/workspace`. Data survives session stop/resume automatically. Configured via `filesystemConfigurations` on the Runtime
-- **Symlink**: `~/.openclaw` → `/mnt/workspace/.openclaw` — created during lazy init, transparent to OpenClaw and all skills
+- **Real workspace dir**: The contract server ensures a real `~/.openclaw` directory exists and copies to/from `/mnt/workspace/.openclaw` when session storage is available
 - **S3 backup**: `workspace-sync.js` continues to run at 5 min interval (unchanged). Backs up to `{namespace}/.openclaw/` in the user files S3 bucket
 - **Restore logic**: On init, if session storage has existing data → skip S3 restore (resumed session). If empty → restore from S3 backup (new session or version update)
+- **Managed workspace bootstrap**: Managed workspace files (`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `MEMORY.md`, plus `agents/<agent>/...`) are read from `{namespace}/...` first and fall back to `{managed_workspace_bootstrap_namespace}/...` for first-run users. CDK uploads `bootstrap/managed-workspace/` to that shared prefix before the runtime is deployed.
 - **Fallback**: If session storage mount not available → full S3 sync mode (5 min interval, existing behavior)
 - **Data lifecycle**: Session storage cleared on 14-day inactivity or runtime version update. S3 backup preserves data across these events
 - **⚠️ Version update clears session storage**: Every `update-agent-runtime` (new container image) resets session storage to empty. S3 backup auto-restores on next session start, but there is a window where the latest changes (since last S3 backup) may be lost. Always ensure S3 backup has run before deploying new versions
