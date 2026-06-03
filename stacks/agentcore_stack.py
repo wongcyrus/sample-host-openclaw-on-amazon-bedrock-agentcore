@@ -16,6 +16,8 @@ from aws_cdk import (
     aws_iam as iam,
     aws_kms as kms,
     aws_s3 as s3,
+    aws_s3_deployment as s3_deployment,
+    aws_ssm as ssm,
 )
 import cdk_nag
 from constructs import Construct
@@ -56,11 +58,19 @@ class AgentCoreStack(Stack):
         is_dev = suffix == "dev"
         region = Stack.of(self).region
         account = Stack.of(self).account
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         execution_role_name = namer.name(f"openclaw-agentcore-execution-role-{region}")
         cron_schedule_group_name = namer.name("openclaw-cron")
         cron_lambda_name = namer.name("openclaw-cron-executor")
         scheduler_role_name = namer.name(f"openclaw-cron-scheduler-role-{region}")
         identity_table_name = namer.name("openclaw-identity")
+        runtime_name_base = str(
+            self.node.try_get_context("agentcore_runtime_name_base") or "openclaw_agent"
+        ).strip()
+        runtime_arn_parameter_name = namer.with_suffix("/openclaw/agentcore/runtime-arn")
+        runtime_endpoint_parameter_name = namer.with_suffix(
+            "/openclaw/agentcore/runtime-endpoint-id"
+        )
         secret_resource_arns = [
             gateway_token_secret_arn,
             cognito_password_secret_arn,
@@ -167,7 +177,7 @@ class AgentCoreStack(Stack):
         )
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["kms:Decrypt"],
+                actions=["kms:Decrypt", "kms:GenerateDataKey"],
                 resources=[cmk_arn],
             )
         )
@@ -187,6 +197,31 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
+
+        humanoid_auth_mode = str(
+            self.node.try_get_context("humanoid_mcp_auth_mode") or "iam"
+        ).strip().lower()
+        humanoid_function_arn = str(
+            self.node.try_get_context("humanoid_mcp_function_arn") or ""
+        ).strip()
+        if humanoid_auth_mode == "iam" and humanoid_function_arn:
+            self.execution_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["lambda:InvokeFunctionUrl"],
+                    resources=[humanoid_function_arn],
+                    conditions={
+                        "StringEquals": {
+                            "lambda:FunctionUrlAuthType": "AWS_IAM",
+                        }
+                    },
+                )
+            )
+            self.execution_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["lambda:InvokeFunction"],
+                    resources=[humanoid_function_arn],
+                )
+            )
 
         # STS self-assume for per-user scoped S3 credentials
         self.execution_role.add_to_policy(
@@ -284,6 +319,7 @@ class AgentCoreStack(Stack):
             self.node.try_get_context("user_files_ttl_days") or "365"
         )
         user_files_cmk = kms.Key.from_key_arn(self, "UserFilesCmk", cmk_arn)
+        user_files_bucket_kms_arn = cmk_arn
         bucket_name = namer.name(f"openclaw-user-files-{account}-{region}")
         reuse_existing_bucket_raw = (
             self.node.try_get_context("reuse_existing_user_files_bucket")
@@ -321,6 +357,25 @@ class AgentCoreStack(Stack):
                 ) from err
 
         if reuse_existing_bucket:
+            s3_client = boto3.client("s3", region_name=region)
+            try:
+                encryption = s3_client.get_bucket_encryption(Bucket=bucket_name)
+                rules = encryption.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])
+                if rules:
+                    bucket_kms_key = (
+                        rules[0]
+                        .get("ApplyServerSideEncryptionByDefault", {})
+                        .get("KMSMasterKeyID")
+                    )
+                    if bucket_kms_key and bucket_kms_key.startswith("arn:aws:kms:"):
+                        user_files_bucket_kms_arn = bucket_kms_key
+            except ClientError as err:
+                error_code = str(err.response.get("Error", {}).get("Code", ""))
+                Annotations.of(self).add_warning(
+                    "Failed to inspect encryption for the reused user-files bucket "
+                    f"{bucket_name}. Runtime KMS permissions may be incomplete. "
+                    f"S3 lookup error: {error_code}"
+                )
             self.user_files_bucket = s3.Bucket.from_bucket_name(
                 self, "UserFilesBucket", bucket_name
             )
@@ -346,6 +401,13 @@ class AgentCoreStack(Stack):
 
         # S3 per-user file storage permissions
         self.user_files_bucket.grant_read_write(self.execution_role)
+        if user_files_bucket_kms_arn != cmk_arn:
+            self.execution_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["kms:Decrypt", "kms:GenerateDataKey"],
+                    resources=[user_files_bucket_kms_arn],
+                )
+            )
 
         # --- AgentCore Browser (optional) -------------------------------------
         enable_browser = str(self.node.try_get_context("enable_browser") or "false").lower() == "true"
@@ -438,6 +500,30 @@ class AgentCoreStack(Stack):
         cron_lead_time_minutes = int(
             self.node.try_get_context("cron_lead_time_minutes") or "5"
         )
+        managed_workspace_bootstrap_namespace = (
+            self.node.try_get_context("managed_workspace_bootstrap_namespace")
+            or "workspace-bootstrap"
+        )
+        bootstrap_workspace_dir = os.path.join(
+            project_root, "bootstrap", "managed-workspace"
+        )
+
+        bootstrap_workspace_deployment = s3_deployment.BucketDeployment(
+            self,
+            "ManagedWorkspaceBootstrapDeployment",
+            destination_bucket=self.user_files_bucket,
+            destination_key_prefix=managed_workspace_bootstrap_namespace,
+            sources=[s3_deployment.Source.asset(bootstrap_workspace_dir)],
+            prune=True,
+        )
+        user_files_bucket_kms_key = kms.Key.from_key_arn(
+            self,
+            "UserFilesBucketDeploymentKey",
+            user_files_bucket_kms_arn,
+        )
+        user_files_bucket_kms_key.grant_encrypt_decrypt(
+            bootstrap_workspace_deployment.handler_role
+        )
 
         runtime_env = {
             "AWS_REGION": region,
@@ -457,14 +543,32 @@ class AgentCoreStack(Stack):
             "CRON_LEAD_TIME_MINUTES": str(cron_lead_time_minutes),
             "SUBAGENT_BEDROCK_MODEL_ID": subagent_model_id,
             "TELEGRAM_CHANNEL_SECRET_ID": telegram_token_secret_name,
+            "MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE": managed_workspace_bootstrap_namespace,
+            "DASHBOARD_API_PUSH_URL": str(
+                self.node.try_get_context("dashboard_api_push_url") or ""
+            ).strip(),
         }
+        humanoid_mcp_url = str(
+            self.node.try_get_context("humanoid_mcp_server_url") or ""
+        ).strip()
+        if humanoid_mcp_url:
+            runtime_env["HUMANOID_MCP_SERVER_URL"] = humanoid_mcp_url
+        humanoid_mcp_auth_mode = str(
+            self.node.try_get_context("humanoid_mcp_auth_mode") or ""
+        ).strip()
+        if humanoid_mcp_auth_mode:
+            runtime_env["HUMANOID_MCP_AUTH_MODE"] = humanoid_mcp_auth_mode
+        humanoid_mcp_api_key_header = str(
+            self.node.try_get_context("humanoid_mcp_api_key_header") or ""
+        ).strip()
+        if humanoid_mcp_api_key_header:
+            runtime_env["HUMANOID_MCP_API_KEY_HEADER"] = humanoid_mcp_api_key_header
         if self.browser_id:
             runtime_env["BROWSER_IDENTIFIER"] = self.browser_id
         if guardrail_id:
             runtime_env["BEDROCK_GUARDRAIL_ID"] = guardrail_id
             runtime_env["BEDROCK_GUARDRAIL_VERSION"] = guardrail_version or "DRAFT"
 
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         image_version = str(self.node.try_get_context("image_version") or "1")
         runtime_artifact = agentcore.AgentRuntimeArtifact.from_asset(
             project_root,
@@ -486,7 +590,7 @@ class AgentCoreStack(Stack):
         self.runtime = agentcore.Runtime(
             self,
             "Runtime",
-            runtime_name=namer.runtime_name("openclaw_agent_v2"),
+            runtime_name=namer.runtime_name(runtime_name_base),
             agent_runtime_artifact=runtime_artifact,
             authorizer_configuration=agentcore.RuntimeAuthorizerConfiguration.using_iam(),
             environment_variables=runtime_env,
@@ -497,6 +601,7 @@ class AgentCoreStack(Stack):
             ),
             network_configuration=runtime_network_config,
         )
+        self.runtime.node.add_dependency(bootstrap_workspace_deployment)
 
         runtime_cfn = self.runtime.node.default_child
         if isinstance(runtime_cfn, agentcore.CfnRuntime):
@@ -508,18 +613,32 @@ class AgentCoreStack(Stack):
                 )
             ]
 
-        self.runtime_endpoint = self.runtime.add_endpoint(
-            namer.runtime_name("openclaw_endpoint"),
-            description="Default endpoint for the OpenClaw AgentCore runtime",
-        )
         self.runtime_arn = self.runtime.agent_runtime_arn
-        self.runtime_endpoint_id = self.runtime_endpoint.endpoint_id
+        self.runtime_endpoint_id = "DEFAULT"
+        self.runtime_arn_parameter = ssm.StringParameter(
+            self,
+            "RuntimeArnParameter",
+            parameter_name=runtime_arn_parameter_name,
+            string_value=self.runtime.agent_runtime_arn,
+        )
+        self.runtime_endpoint_parameter = ssm.StringParameter(
+            self,
+            "RuntimeEndpointParameter",
+            parameter_name=runtime_endpoint_parameter_name,
+            string_value=self.runtime_endpoint_id,
+        )
 
         # --- Outputs ----------------------------------------------------------
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
         CfnOutput(self, "RuntimeArn", value=self.runtime.agent_runtime_arn)
         CfnOutput(self, "RuntimeId", value=self.runtime.agent_runtime_id)
-        CfnOutput(self, "RuntimeEndpointId", value=self.runtime_endpoint.endpoint_id)
+        CfnOutput(self, "RuntimeEndpointId", value=self.runtime_endpoint_id)
+        CfnOutput(self, "RuntimeArnParameterName", value=runtime_arn_parameter_name)
+        CfnOutput(
+            self,
+            "RuntimeEndpointParameterName",
+            value=runtime_endpoint_parameter_name,
+        )
         CfnOutput(self, "SecurityGroupId", value=self.agent_sg.security_group_id)
         CfnOutput(self, "UserFilesBucketName", value=self.user_files_bucket.bucket_name)
         CfnOutput(
@@ -607,6 +726,59 @@ class AgentCoreStack(Stack):
                     id="CdkNagValidationFailure",
                     reason="Security group rule uses Fn::GetAtt for VPC CIDR which "
                     "cannot be validated at synth time.",
+                ),
+            ],
+        )
+        bucket_deployment_path = (
+            f"/{construct_id}/Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C"
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"{bucket_deployment_path}/ServiceRole/Resource",
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM4",
+                    reason="CDK BucketDeployment uses AWSLambdaBasicExecutionRole for its "
+                    "generated helper Lambda, and the managed policy cannot be replaced.",
+                    applies_to=[
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                ),
+            ],
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"{bucket_deployment_path}/ServiceRole/DefaultPolicy/Resource",
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="CDK BucketDeployment syncs the bootstrap workspace asset into a "
+                    "single prefix in the project user-files bucket. The generated custom "
+                    "resource requires wildcard S3 and KMS permissions for asset reads, "
+                    "object sync, and prune/delete operations.",
+                    applies_to=[
+                        "Action::s3:GetBucket*",
+                        "Action::s3:GetObject*",
+                        "Action::s3:List*",
+                        "Action::s3:Abort*",
+                        "Action::s3:DeleteObject*",
+                        "Action::kms:GenerateDataKey*",
+                        "Action::kms:ReEncrypt*",
+                        f"Resource::arn:aws:s3:::cdk-hnb659fds-assets-{account}-{region}/*",
+                        f"Resource::arn:aws:s3:::{bucket_name}/*",
+                        "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
+                    ],
+                ),
+            ],
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"{bucket_deployment_path}/Resource",
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason="CDK BucketDeployment manages its helper Lambda runtime and "
+                    "does not expose an override to pin the latest runtime directly.",
                 ),
             ],
         )

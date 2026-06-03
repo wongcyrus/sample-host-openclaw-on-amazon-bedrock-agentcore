@@ -30,8 +30,6 @@ class CronStack(Stack):
         scope: Construct,
         construct_id: str,
         *,
-        runtime_arn: str,
-        runtime_endpoint_id: str,
         identity_table_name: str,
         identity_table_arn: str,
         telegram_token_secret_name: str,
@@ -56,6 +54,18 @@ class CronStack(Stack):
         scheduler_role_name = namer.name(f"openclaw-cron-scheduler-role-{region}")
         cron_log_group_name = namer.name("/openclaw/lambda/cron")
         cron_lambda_name = namer.name("openclaw-cron-executor")
+        runtime_arn_parameter_name = namer.with_suffix("/openclaw/agentcore/runtime-arn")
+        runtime_endpoint_parameter_name = namer.with_suffix(
+            "/openclaw/agentcore/runtime-endpoint-id"
+        )
+        runtime_parameter_arns = [
+            f"arn:aws:ssm:{region}:{account}:parameter{runtime_arn_parameter_name}",
+            f"arn:aws:ssm:{region}:{account}:parameter{runtime_endpoint_parameter_name}",
+        ]
+        runtime_name_patterns = {
+            f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent')}*",
+            f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent_v2')}*",
+        }
         secret_resource_arns = [
             telegram_token_secret_arn,
             slack_token_secret_arn,
@@ -98,8 +108,8 @@ class CronStack(Stack):
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
             environment={
-                "AGENTCORE_RUNTIME_ARN": runtime_arn,
-                "AGENTCORE_QUALIFIER": runtime_endpoint_id,
+                "AGENTCORE_RUNTIME_ARN_PARAMETER": runtime_arn_parameter_name,
+                "AGENTCORE_QUALIFIER_PARAMETER": runtime_endpoint_parameter_name,
                 "IDENTITY_TABLE_NAME": identity_table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
@@ -135,10 +145,14 @@ class CronStack(Stack):
                     "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeAgentRuntimeForUser",
                 ],
-                resources=[
-                    runtime_arn,
-                    f"{runtime_arn}/*",
-                ],
+                resources=sorted(runtime_name_patterns),
+            )
+        )
+
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:GetParameter", "ssm:GetParameters"],
+                resources=runtime_parameter_arns,
             )
         )
 
@@ -253,12 +267,14 @@ class CronStack(Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
-                    "runtime-endpoint sub-resource path (runtime/{id}/*). "
+                    "the transition wildcard runtime ARN while Router/Cron move off "
+                    "cross-stack exports. "
                     "Secrets Manager scoped to the cron delivery channel secrets. DynamoDB "
                     "index wildcard needed for query operations.",
                     applies_to=[
-                        "Resource::<Runtime99E3DDFA.AgentRuntimeArn>/*",
-                    *[f"Resource::{secret_arn}" for secret_arn in secret_resource_arns],
+                        f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent')}*",
+                        f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent_v2')}*",
+                        *[f"Resource::{secret_arn}" for secret_arn in secret_resource_arns],
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
                     ],
                 ),

@@ -31,8 +31,8 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Configuration ---
-AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
-AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
+AGENTCORE_RUNTIME_ARN_PARAMETER = os.environ["AGENTCORE_RUNTIME_ARN_PARAMETER"]
+AGENTCORE_QUALIFIER_PARAMETER = os.environ["AGENTCORE_QUALIFIER_PARAMETER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
@@ -58,6 +58,7 @@ agentcore_client = boto3.client(
 )
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
+ssm_client = boto3.client("ssm", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 
 USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
@@ -65,6 +66,8 @@ USER_FILES_BUCKET = os.environ.get("USER_FILES_BUCKET", "")
 # --- Token cache (survives across warm invocations, 15-min TTL) ---
 _SECRET_CACHE_TTL_SECONDS = 900  # 15 minutes
 _token_cache = {}  # {secret_id: (value, fetched_at)}
+_RUNTIME_CONFIG_CACHE_TTL_SECONDS = 300
+_runtime_config_cache = {"runtime_arn": "", "qualifier": "", "fetched_at": 0.0}
 
 BIND_CODE_TTL_SECONDS = 600  # 10 minutes
 
@@ -86,6 +89,30 @@ def _get_secret(secret_id):
     except Exception as e:
         logger.warning("Failed to fetch secret %s: %s", secret_id, e)
         return ""
+
+
+def _get_runtime_config():
+    """Fetch AgentCore runtime settings from CDK-managed SSM parameters."""
+    if (
+        _runtime_config_cache["runtime_arn"]
+        and _runtime_config_cache["qualifier"]
+        and time.time() - _runtime_config_cache["fetched_at"] < _RUNTIME_CONFIG_CACHE_TTL_SECONDS
+    ):
+        return _runtime_config_cache["runtime_arn"], _runtime_config_cache["qualifier"]
+
+    names = [AGENTCORE_RUNTIME_ARN_PARAMETER, AGENTCORE_QUALIFIER_PARAMETER]
+    resp = ssm_client.get_parameters(Names=names, WithDecryption=False)
+    values = {item["Name"]: item["Value"] for item in resp.get("Parameters", [])}
+    missing = [name for name in names if not values.get(name)]
+    if missing:
+        raise RuntimeError(
+            "Missing AgentCore runtime SSM parameters: " + ", ".join(sorted(missing))
+        )
+
+    _runtime_config_cache["runtime_arn"] = values[AGENTCORE_RUNTIME_ARN_PARAMETER]
+    _runtime_config_cache["qualifier"] = values[AGENTCORE_QUALIFIER_PARAMETER]
+    _runtime_config_cache["fetched_at"] = time.time()
+    return _runtime_config_cache["runtime_arn"], _runtime_config_cache["qualifier"]
 
 
 def _get_telegram_token():
@@ -614,6 +641,7 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
 
     Message can be a plain string or a structured dict with text + images.
     """
+    runtime_arn, qualifier = _get_runtime_config()
     payload = json.dumps({
         "action": "chat",
         "userId": user_id,
@@ -623,10 +651,10 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
     }).encode()
 
     try:
-        logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s", AGENTCORE_RUNTIME_ARN, AGENTCORE_QUALIFIER, session_id)
+        logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s", runtime_arn, qualifier, session_id)
         resp = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
+            agentRuntimeArn=runtime_arn,
+            qualifier=qualifier,
             runtimeSessionId=session_id,
             runtimeUserId=actor_id,
             payload=payload,
@@ -718,6 +746,49 @@ def _extract_text_from_content_blocks(text):
         if result == prev:
             break
     return result
+
+
+_INTERNAL_WORKFLOW_PATTERNS = [
+    re.compile(r"^⏳ Working on your request\b", re.IGNORECASE),
+    re.compile(r"^I'll send the full response when it's ready\.?$", re.IGNORECASE),
+    re.compile(r"^I don't see a [\w-]+ agent configured yet\.?$", re.IGNORECASE),
+    re.compile(r"^I see there (?:are|were)\b", re.IGNORECASE),
+    re.compile(r"^I see [—-] the .*allowed list for spawning\b", re.IGNORECASE),
+    re.compile(r"^(?:Let me|Now I understand!?|I need to) \b", re.IGNORECASE),
+    re.compile(
+        r"^I need to (?:check|look|see|inspect|review|verify|try|execute|use|delegate|spawn|forward|read|search)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _sanitize_agent_response_text(text):
+    """Strip internal workflow chatter before sending a channel response."""
+    if not text or not isinstance(text, str):
+        return text
+
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    parts = re.split(
+        r'(?<=[A-Za-z\)"\'\]\u4e00-\u9fff][.!?])\s+(?=(?:[A-Z⏳]))',
+        cleaned,
+    )
+    filtered = []
+    removed = False
+    for part in parts:
+        sentence = part.strip()
+        if not sentence:
+            continue
+        if any(pattern.match(sentence) for pattern in _INTERNAL_WORKFLOW_PATTERNS):
+            removed = True
+            continue
+        filtered.append(sentence)
+
+    if removed and filtered:
+        return re.sub(r"\s{2,}", " ", " ".join(filtered)).strip()
+    return cleaned
 
 
 def _tables_to_bullets(text):

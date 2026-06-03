@@ -37,6 +37,7 @@ Users can send **text and images** — photos sent via Telegram or Slack are dow
 - Multimodal: text + image messages via Bedrock ConverseStream
 - STS session-scoped credentials (per-user S3, DynamoDB, Secrets Manager isolation)
 - Custom skills: S3 file storage, EventBridge cron scheduling, API key management, ClawHub skill installer
+- Optional humanoid robot skill with Bedrock-backed multi-agent workers (`robot_1`..`robot_6`)
 - Headless browser (optional, AgentCore Browser API)
 - AWS Bedrock Guardrails — content filtering, PII redaction, topic denial, word filters, prompt attack detection
 - LLM red team testing — 62 test cases across 12 attack categories via promptfoo
@@ -159,6 +160,64 @@ AgentCore microVMs are ephemeral — they're destroyed when idle. OpenClaw store
 
 This lets the system behave like a persistent server (continuous conversation history) while benefiting from serverless economics (no idle compute costs).
 
+### Local Editing of Per-Agent Workspace Files
+
+You can pull the managed per-agent workspace files to your laptop, edit them locally, then push them back to S3:
+
+```bash
+./scripts/sync-agent-workspace.sh pull
+./scripts/sync-agent-workspace.sh push
+```
+
+By default, the script uses the `dev` env file, reads `TELEGRAM_ADMIN_USER_ID`, and targets `telegram:<id>` automatically. It stores files in `~/.openclaw-agent-workspaces/<namespace>` using an OpenClaw-style layout:
+
+- workspace-root files such as `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, and `MEMORY.md`
+- per-agent folders such as `robot_1/`, `robot_2/`, and so on
+
+The workspace-root files map to `s3://.../<namespace>/<FILE>`. Agent folders map to `s3://.../<namespace>/agents/<agent>/<FILE>`. This lets you review and edit the workspace locally in the same shape as the reference OpenClaw workspace. If you need to remove a remote file entirely, run `push --delete-missing` after deleting it locally. Active sessions do not reload these files instantly, so stop the user's current AgentCore session or wait for it to recycle before checking the new behavior.
+
+### Repo-Managed Bootstrap Workspace
+
+The repository can now seed the **initial managed workspace** for first-run users. Put the curated bootstrap files in `bootstrap/managed-workspace/` using the same S3 layout the runtime reads:
+
+- root files such as `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, and `MEMORY.md`
+- per-agent files under `agents/<agent-id>/...`
+
+During the **OpenClawAgentCore** stack deployment, CDK publishes that directory as an **S3 asset** and a `BucketDeployment` copies it to:
+
+```text
+s3://<user-files-bucket>/<managed_workspace_bootstrap_namespace>/
+```
+
+By default, `managed_workspace_bootstrap_namespace` is `workspace-bootstrap` in `cdk.json`. On first run, the contract server still prefers user-specific managed workspace files in `s3://.../<namespace>/...`; it falls back to the shared bootstrap files only when that user has no managed workspace files yet. To update the shared bootstrap, edit `bootstrap/managed-workspace/` and redeploy the `OpenClawAgentCore` stack.
+
+### Resetting a User's Agents / Workspace
+
+To reset a user back to the shared bootstrap workspace, delete that user's **managed workspace files** from their own namespace and then stop their current AgentCore session (or wait for it to recycle). Do **not** delete `workspace-bootstrap/` unless you want to change the shared first-run defaults for everyone.
+
+For a user namespace such as `telegram_<your_user_id>`, the user-specific managed workspace files live at:
+
+- `s3://<user-files-bucket>/telegram_<your_user_id>/<FILE>`
+- `s3://<user-files-bucket>/telegram_<your_user_id>/agents/<agent-id>/<FILE>`
+
+Examples include:
+
+- `telegram_<your_user_id>/AGENTS.md`
+- `telegram_<your_user_id>/USER.md`
+- `telegram_<your_user_id>/agents/main/AGENTS.md`
+- `telegram_<your_user_id>/agents/robot_1/AGENTS.md`
+
+After those user-specific managed workspace files are gone, the runtime falls back to:
+
+- `s3://<user-files-bucket>/workspace-bootstrap/<FILE>`
+- `s3://<user-files-bucket>/workspace-bootstrap/agents/<agent-id>/<FILE>`
+
+If you want a **full wipe** instead of a bootstrap reset, also delete the user's `.openclaw` backup prefix:
+
+- `s3://<user-files-bucket>/telegram_<your_user_id>/.openclaw/`
+
+That removes the persisted OpenClaw session state in S3. The currently running session may still have in-memory / mounted state until you stop that runtime session, so a clean reset should always end with a session stop or a wait for idle termination before you test the result.
+
 ### Security
 
 This solution applies **defense-in-depth** across network, application, identity, and data layers. Key controls include:
@@ -253,9 +312,36 @@ OPENCLAW_ENV_SUFFIX=dev
 CDK_DEFAULT_REGION=us-east-1
 ```
 
+If you want the runtime to expose the bundled humanoid robot workers (`robot_1`..`robot_6`), set these `cdk.json` context values:
+
+```json
+"humanoid_mcp_server_url": "https://your-mcp-endpoint.lambda-url.us-east-1.on.aws/"
+```
+
+For an IAM-protected Lambda Function URL, also set:
+
+```json
+"humanoid_mcp_auth_mode": "iam",
+"humanoid_mcp_function_arn": "arn:aws:lambda:us-east-1:123456789012:function:your-humanoid-function"
+```
+
+For an API-key protected endpoint, switch the auth mode instead:
+
+```json
+"humanoid_mcp_auth_mode": "api-key",
+"humanoid_mcp_api_key_header": "x-api-key"
+```
+
+These humanoid settings are injected into the **AgentCore runtime** in **Phase 2** (`OpenClawAgentCore`), not the Router stack. After changing them, redeploy the runtime phase and start a fresh session so the updated robot-agent configuration is picked up:
+
+```bash
+./scripts/deploy.sh --env dev --runtime-only
+```
+
 If you keep multiple env files, the scripts load **one file only**:
 
-- default: `.env`
+- default when present: `.env.dev`
+- fallback default: `.env`
 - override: `OPENCLAW_ENV_FILE=/path/to/file`
 - shortcut: `--env <name>` loads `.env.<name>`
 
@@ -267,9 +353,15 @@ Examples:
 ./scripts/undeploy.sh --env prod --all
 ```
 
-The scripts do **not** merge `.env` with `.env.prod` or `.env.dev`. The selected file is sourced as-is, and its values become the deployment settings for that run. `--env prod` is shorthand for selecting `.env.prod`, and it also requires the final `OPENCLAW_ENV_SUFFIX` to be `prod`.
+The scripts do **not** merge `.env` with `.env.prod` or `.env.dev`. The selected file is sourced as-is, and its values become the deployment settings for that run. With no `--env`, the scripts now prefer `.env.dev` when it exists; otherwise they fall back to `.env`. `--env prod` is shorthand for selecting `.env.prod`, and it also requires the final `OPENCLAW_ENV_SUFFIX` to be `prod`.
+
+For teardown, `undeploy.sh --env prod` has one extra compatibility rule: if no `OpenClaw*-prod` stacks exist, it automatically falls back to the unsuffixed `OpenClaw*` stack set. That keeps legacy unsuffixed prod deployments removable while still letting `prod` be the named environment going forward.
 
 `deploy.sh` now fails fast before deployment if required settings are missing or inconsistent. For example, it rejects a missing `OPENCLAW_ENV_FILE`, a non-numeric `TELEGRAM_ADMIN_USER_ID`, an invalid-looking `TELEGRAM_BOT_TOKEN`, or Telegram bootstrap settings used with a mode that does not deploy the Router stack.
+
+It also fails fast when `OPENCLAW_ENV_SUFFIX` / `environment_suffix` points at a named environment like `dev` but you forgot to select the matching env file.
+
+Runtime settings are CDK-owned. In particular, `dashboard_api_push_url`, `humanoid_mcp_server_url`, `humanoid_mcp_auth_mode`, `humanoid_mcp_function_arn`, and `humanoid_mcp_api_key_header` should be set in `cdk.json` context rather than `.env*` files.
 
 If you also set these Telegram values, deployment will bootstrap the bot automatically:
 
@@ -278,7 +370,7 @@ TELEGRAM_BOT_TOKEN=123456:your-bot-token
 TELEGRAM_ADMIN_USER_ID=123456789
 ```
 
-That makes `./scripts/deploy.sh` pass Router-stack bootstrap parameters so a custom resource can do all of the following without a separate setup step:
+That makes `./scripts/deploy.sh` load the selected `.env*` file into the Router bootstrap Lambda environment so the custom resource can do all of the following without a separate setup step:
 1. Store the Telegram bot token in Secrets Manager
 2. Register the Telegram webhook against the deployed Router URL
 3. Add your Telegram account to the DynamoDB allowlist
@@ -294,7 +386,7 @@ By default, this repository uses **unsuffixed** stack names unless you set `OPEN
 
 The deploy script runs three phases automatically:
 1. **Phase 1 (CDK)** — VPC, Security, Guardrails, Observability stacks
-2. **Phase 2 (CDK)** — AgentCore runtime stack (container asset, runtime, endpoint, browser, session storage)
+2. **Phase 2 (CDK)** — AgentCore runtime stack (container asset, managed-workspace bootstrap `BucketDeployment`, runtime, endpoint, browser, session storage). The runtime is explicitly ordered after the bootstrap upload.
 3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks
 
 The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, Docker when needed, and required deployment setting validation) before starting.
@@ -487,7 +579,7 @@ openclaw-on-agentcore/
 | **OpenClawVpc** | VPC foundation. `environment_suffix == "dev"`: public subnets only, no NAT, no VPC endpoints. Other suffixes: public + private subnets, NAT, VPC endpoints, flow logs | None |
 | **OpenClawSecurity** | KMS CMK, Secrets Manager (7 secrets incl. webhook validation), Cognito User Pool, optional CloudTrail | None |
 | **OpenClawGuardrails** | CfnGuardrail (content filters, topic denial, PII, word filters, regex), CfnGuardrailVersion | Security |
-| **OpenClawAgentCore** | CfnRuntime, CfnRuntimeEndpoint, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM. Runtime network mode is `PUBLIC` only when `environment_suffix == "dev"`; otherwise it uses VPC mode | Vpc, Security, Guardrails |
+| **OpenClawAgentCore** | CfnRuntime, CfnWorkloadIdentity, ECR, S3 bucket, SG, IAM. Uses the built-in `DEFAULT` runtime endpoint qualifier instead of creating a second named endpoint. Runtime network mode is `PUBLIC` only when `environment_suffix == "dev"`; otherwise it uses VPC mode | Vpc, Security, Guardrails |
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms (errors, latency, throttles), SNS, Bedrock logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
@@ -516,6 +608,7 @@ All tunable parameters are in `cdk.json`:
 | `session_idle_timeout` | `1800` | Requested per-user session idle timeout (seconds). In `dev`, the effective value is clamped to the dev max lifetime. |
 | `session_max_lifetime` | `1800` non-dev default, `600` in `dev` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
+| `managed_workspace_bootstrap_namespace` | `workspace-bootstrap` | Shared S3 prefix for the repo-managed initial managed workspace. `OpenClawAgentCore` uploads `bootstrap/managed-workspace/` here during deploy, and first-run users fall back to it only when their own managed workspace files do not exist yet |
 | `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
@@ -532,6 +625,8 @@ All tunable parameters are in `cdk.json`:
 | `enable_browser` | `false` | Enable headless Chromium browser inside the container. CDK creates the browser resource and wires `BROWSER_IDENTIFIER` automatically |
 
 Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh` or `./scripts/deploy.sh --env prod`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
+
+The runtime-facing MCP and dashboard settings are configured in `cdk.json` context (`dashboard_api_push_url`, `humanoid_mcp_server_url`, `humanoid_mcp_auth_mode`, `humanoid_mcp_function_arn`, `humanoid_mcp_api_key_header`) so CDK owns both the runtime env injection and the matching IAM grant.
 
 Named resources that are intentionally long-lived are auto-reused during synth when they already exist with the expected suffixed name. Today that includes:
 
@@ -562,10 +657,11 @@ All helper scripts (`deploy.sh`, `undeploy.sh`, `setup-telegram.sh`, `setup-slac
 Examples:
 
 ```bash
-./scripts/deploy.sh                             # loads ./.env
+./scripts/deploy.sh                             # loads ./.env.dev when present, otherwise ./.env
 ./scripts/deploy.sh --env dev                  # loads ./.env.dev
 ./scripts/deploy.sh --env prod                 # loads ./.env.prod
-./scripts/undeploy.sh --env prod --all         # loads ./.env.prod
+./scripts/undeploy.sh                          # loads ./.env.dev when present, otherwise ./.env
+./scripts/undeploy.sh --env prod --all         # loads ./.env.prod; falls back to unsuffixed prod stacks when needed
 ```
 
 Recommended pattern:
@@ -1036,6 +1132,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **Push image after CDK deploy**: The CDK AgentCore stack creates the ECR repository. Do **not** manually create it beforehand (causes a `Resource already exists` error). Deploy CDK first, then push the image. AgentCore only pulls the image when a user session starts, not at deploy time.
 - **AgentCore resource names**: Must match `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` — use underscores, not hyphens.
 - **Per-user sessions**: Contract returns `Healthy` (not `HealthyBusy`) — allows natural idle termination after `session_idle_timeout`.
+- **Managed workspace precedence**: First-run managed workspace files are resolved from `s3://<bucket>/<user-namespace>/...` first and fall back to `s3://<bucket>/<managed_workspace_bootstrap_namespace>/...` only when the user-specific files do not exist.
 - **VPC endpoints**: The `bedrock-agentcore-runtime` VPC endpoint is not available in all regions. Omit it if your region doesn't support it.
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
 - **Cognito passwords**: HMAC-derived (`HMAC-SHA256(secret, actorId)`) — deterministic, never stored. Enables `AdminInitiateAuth` without per-user password storage.
@@ -1058,7 +1155,11 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 
 `undeploy.sh` no longer scans DynamoDB for session IDs. It now uses only runtime-scoped AgentCore session discovery when the installed AWS tooling exposes that API; otherwise, stop any active sessions manually or wait for them to idle out before VPC teardown.
 
-> **Known issue:** production teardown is not always one-shot. The AgentCore Runtime control plane does not always release its ENI immediately, so the `OpenClawAgentCore-prod` / `OpenClawVpc-prod` cleanup can block on VPC dependencies even after the runtime delete starts. If that happens, wait about **8 hours** and re-run your teardown wrapper (`underlying.sh` if that is what you use, or `./scripts/undeploy.sh` in this repo).
+> **Known issue:** production teardown is not always one-shot. The AgentCore Runtime control plane does not always release its ENI immediately, so the `OpenClawAgentCore-prod` / `OpenClawVpc-prod` cleanup can block on VPC dependencies even after the runtime delete starts. The undeploy script now retries by retaining the AgentCore runtime security group when CloudFormation is stuck on dependent ENIs. If AgentCore still holds the ENI for too long, wait about **8 hours** and re-run your teardown wrapper (`underlying.sh` if that is what you use, or `./scripts/undeploy.sh` in this repo).
+>
+> If your production deployment predates the `-prod` suffix and still uses unsuffixed stack names, `./scripts/undeploy.sh --env prod` now detects that and tears down `OpenClawAgentCore` / `OpenClawVpc` instead of requiring a separate command.
+>
+> Bedrock Guardrails teardown can also fail on `AWS::Bedrock::GuardrailVersion` with `AccessDenied` during delete. When that happens, the undeploy script retries by retaining the `ContentGuardrail` / `ContentGuardrailVersion` resources so the stack can finish deleting cleanly, then it deletes the retained guardrail directly through the Bedrock API.
 
 There are **two separate cleanup layers**:
 
@@ -1073,14 +1174,14 @@ Common cleanup variants:
 
 ```bash
 ./scripts/undeploy.sh                                   # destroy deployable stacks, keep OpenClawSecurity
-./scripts/undeploy.sh --env dev                        # same as above, but loads ./.env.dev
+./scripts/undeploy.sh --env dev                        # explicitly target ./.env.dev
 ./scripts/undeploy.sh --delete-user-files-bucket        # also delete the retained S3 user-files bucket
 ./scripts/undeploy.sh --all                             # also destroy OpenClawSecurity
-./scripts/undeploy.sh --env prod --all                 # destroy the prod-suffixed stacks
+./scripts/undeploy.sh --env prod --all                 # destroy the prod stack set; falls back to unsuffixed legacy prod stacks
 ./scripts/undeploy.sh --all --delete-user-files-bucket  # destroy all included stacks and also delete the user-files bucket
 ```
 
-The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack, and falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on security-group cleanup. For `prod`, do not assume the first teardown run will finish the job — AgentCore may keep the ENI around well after delete starts, so plan to retry roughly **8 hours later**.
+The undeploy script destroys the matching AgentCore stack separately (default: `OpenClawAgentCore-dev`), waits for AgentCore-managed `agentic_ai` ENIs to leave the VPC before deleting the matching VPC stack, falls back to retaining the AgentCore runtime security group if CloudFormation gets stuck on security-group cleanup, and falls back to retaining the Bedrock guardrail resources if GuardrailVersion deletion fails with `AccessDenied`. For `prod`, do not assume the first teardown run will finish the job — AgentCore may keep the ENI around well after delete starts, so plan to retry roughly **8 hours later**.
 
 ### What `--all` really means
 

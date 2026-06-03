@@ -12,8 +12,8 @@ import unittest
 from unittest.mock import MagicMock
 
 # Set required env vars before importing the module
-os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/test")
-os.environ.setdefault("AGENTCORE_QUALIFIER", "test-endpoint")
+os.environ.setdefault("AGENTCORE_RUNTIME_ARN_PARAMETER", "/test/runtime-arn")
+os.environ.setdefault("AGENTCORE_QUALIFIER_PARAMETER", "/test/runtime-endpoint")
 os.environ.setdefault("IDENTITY_TABLE_NAME", "openclaw-identity")
 os.environ.setdefault("USER_FILES_BUCKET", "openclaw-user-files-123456789012-us-west-2")
 

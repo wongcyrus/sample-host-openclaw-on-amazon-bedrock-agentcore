@@ -22,8 +22,8 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # --- Configuration ---
-AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
-AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
+AGENTCORE_RUNTIME_ARN_PARAMETER = os.environ["AGENTCORE_RUNTIME_ARN_PARAMETER"]
+AGENTCORE_QUALIFIER_PARAMETER = os.environ["AGENTCORE_QUALIFIER_PARAMETER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
@@ -43,10 +43,13 @@ agentcore_client = boto3.client(
     ),
 )
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
+ssm_client = boto3.client("ssm", region_name=AWS_REGION)
 
 # --- Token cache (survives across warm invocations, 15-min TTL) ---
 _SECRET_CACHE_TTL_SECONDS = 900  # 15 minutes
 _token_cache = {}  # {secret_id: (value, fetched_at)}
+_RUNTIME_CONFIG_CACHE_TTL_SECONDS = 300
+_runtime_config_cache = {"runtime_arn": "", "qualifier": "", "fetched_at": 0.0}
 
 # --- Constants ---
 WARMUP_POLL_INTERVAL_SECONDS = 15
@@ -70,6 +73,30 @@ def _get_secret(secret_id):
     except Exception as e:
         logger.warning("Failed to fetch secret %s: %s", secret_id, e)
         return ""
+
+
+def _get_runtime_config():
+    """Fetch AgentCore runtime settings from CDK-managed SSM parameters."""
+    if (
+        _runtime_config_cache["runtime_arn"]
+        and _runtime_config_cache["qualifier"]
+        and time.time() - _runtime_config_cache["fetched_at"] < _RUNTIME_CONFIG_CACHE_TTL_SECONDS
+    ):
+        return _runtime_config_cache["runtime_arn"], _runtime_config_cache["qualifier"]
+
+    names = [AGENTCORE_RUNTIME_ARN_PARAMETER, AGENTCORE_QUALIFIER_PARAMETER]
+    resp = ssm_client.get_parameters(Names=names, WithDecryption=False)
+    values = {item["Name"]: item["Value"] for item in resp.get("Parameters", [])}
+    missing = [name for name in names if not values.get(name)]
+    if missing:
+        raise RuntimeError(
+            "Missing AgentCore runtime SSM parameters: " + ", ".join(sorted(missing))
+        )
+
+    _runtime_config_cache["runtime_arn"] = values[AGENTCORE_RUNTIME_ARN_PARAMETER]
+    _runtime_config_cache["qualifier"] = values[AGENTCORE_QUALIFIER_PARAMETER]
+    _runtime_config_cache["fetched_at"] = time.time()
+    return _runtime_config_cache["runtime_arn"], _runtime_config_cache["qualifier"]
 
 
 def _get_telegram_token():
@@ -163,6 +190,7 @@ def resolve_current_user_id(actor_id):
 
 def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None):
     """Invoke AgentCore Runtime with the given action."""
+    runtime_arn, qualifier = _get_runtime_config()
     payload_dict = {
         "action": action,
         "userId": user_id,
@@ -180,8 +208,8 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
             action, session_id, user_id,
         )
         resp = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=AGENTCORE_RUNTIME_ARN,
-            qualifier=AGENTCORE_QUALIFIER,
+            agentRuntimeArn=runtime_arn,
+            qualifier=qualifier,
             runtimeSessionId=session_id,
             runtimeUserId=actor_id,
             payload=payload,

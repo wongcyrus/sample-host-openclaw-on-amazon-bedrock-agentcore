@@ -15,11 +15,14 @@ validate_env_name() {
 resolve_env_file() {
     local project_dir="$1"
     local env_name="${2:-${OPENCLAW_ENV_NAME:-}}"
+    local default_dev_env="$project_dir/.env.dev"
 
     if [ -n "${OPENCLAW_ENV_FILE:-}" ]; then
         printf '%s\n' "$OPENCLAW_ENV_FILE"
     elif [ -n "$env_name" ]; then
         printf '%s/.env.%s\n' "$project_dir" "$env_name"
+    elif [ -f "$default_dev_env" ]; then
+        printf '%s\n' "$default_dev_env"
     else
         printf '%s/.env\n' "$project_dir"
     fi
@@ -29,10 +32,24 @@ load_project_env() {
     local project_dir="$1"
     local env_name="${2:-${OPENCLAW_ENV_NAME:-}}"
     local env_file=""
+    local implied_suffix=""
+    local implied_env_file=""
 
     validate_env_name "$env_name"
     env_file="$(resolve_env_file "$project_dir" "$env_name")"
     export OPENCLAW_SELECTED_ENV_FILE="$env_file"
+
+    if [ -z "${OPENCLAW_ENV_FILE:-}" ] && [ -z "$env_name" ] && [ ! -f "$env_file" ]; then
+        implied_suffix="$(resolve_env_suffix "$project_dir" 2>/dev/null || true)"
+        if [ -n "$implied_suffix" ]; then
+            implied_env_file="$project_dir/.env.$implied_suffix"
+            if [ -f "$implied_env_file" ]; then
+                echo "ERROR: environment_suffix resolves to '$implied_suffix', but no env file was selected."
+                echo "Use --env $implied_suffix or set OPENCLAW_ENV_FILE=$implied_env_file."
+                return 1
+            fi
+        fi
+    fi
 
     if [ -n "${OPENCLAW_ENV_FILE:-}" ] && [ ! -f "$env_file" ]; then
         echo "ERROR: OPENCLAW_ENV_FILE points to a file that does not exist: $env_file"

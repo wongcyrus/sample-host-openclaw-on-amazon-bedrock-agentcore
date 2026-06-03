@@ -7,12 +7,12 @@ is enforced inside the Lambda. Also creates the DynamoDB identity table
 for user resolution and cross-channel binding.
 """
 
+import hashlib
 import os
 import boto3
 from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError
 from aws_cdk import (
     Annotations,
-    CfnParameter,
     CfnOutput,
     CustomResource,
     Duration,
@@ -39,8 +39,6 @@ class RouterStack(Stack):
         scope: Construct,
         construct_id: str,
         *,
-        runtime_arn: str,
-        runtime_endpoint_id: str,
         gateway_token_secret_name: str,
         gateway_token_secret_arn: str,
         telegram_token_secret_name: str,
@@ -72,6 +70,18 @@ class RouterStack(Stack):
         api_access_log_group_name = namer.name("/openclaw/api-access")
         identity_table_name = namer.name("openclaw-identity")
         identity_table_arn = f"arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}"
+        runtime_arn_parameter_name = namer.with_suffix("/openclaw/agentcore/runtime-arn")
+        runtime_endpoint_parameter_name = namer.with_suffix(
+            "/openclaw/agentcore/runtime-endpoint-id"
+        )
+        runtime_parameter_arns = [
+            f"arn:aws:ssm:{region}:{account}:parameter{runtime_arn_parameter_name}",
+            f"arn:aws:ssm:{region}:{account}:parameter{runtime_endpoint_parameter_name}",
+        ]
+        runtime_name_patterns = {
+            f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent')}*",
+            f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent_v2')}*",
+        }
         secret_resource_arns = [
             gateway_token_secret_arn,
             telegram_token_secret_arn,
@@ -79,21 +89,10 @@ class RouterStack(Stack):
             feishu_token_secret_arn,
             webhook_secret_arn,
         ]
-        telegram_bot_token_parameter = CfnParameter(
-            self,
-            "TelegramBotToken",
-            type="String",
-            default="",
-            no_echo=True,
-            description="Optional Telegram bot token for deploy-time bootstrap via custom resource.",
-        )
-        telegram_admin_user_id_parameter = CfnParameter(
-            self,
-            "TelegramAdminUserId",
-            type="String",
-            default=telegram_admin_user_id,
-            description="Optional Telegram numeric user ID to bootstrap into the allowlist.",
-        )
+        telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        bootstrap_config_version = hashlib.sha256(
+            f"{telegram_bot_token}\n{telegram_admin_user_id}".encode("utf-8")
+        ).hexdigest()
 
         # --- DynamoDB Identity Table ---
         dynamodb_client = boto3.client("dynamodb", region_name=region)
@@ -240,8 +239,8 @@ class RouterStack(Stack):
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
             environment={
-                "AGENTCORE_RUNTIME_ARN": runtime_arn,
-                "AGENTCORE_QUALIFIER": runtime_endpoint_id,
+                "AGENTCORE_RUNTIME_ARN_PARAMETER": runtime_arn_parameter_name,
+                "AGENTCORE_QUALIFIER_PARAMETER": runtime_endpoint_parameter_name,
                 "IDENTITY_TABLE_NAME": self.identity_table.table_name,
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
@@ -315,10 +314,14 @@ class RouterStack(Stack):
                     "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeAgentRuntimeForUser",
                 ],
-                resources=[
-                    runtime_arn,
-                    f"{runtime_arn}/*",
-                ],
+                resources=sorted(runtime_name_patterns),
+            )
+        )
+
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:GetParameter", "ssm:GetParameters"],
+                resources=runtime_parameter_arns,
             )
         )
 
@@ -390,6 +393,10 @@ class RouterStack(Stack):
             code=_lambda.Code.from_asset("lambda/bootstrap"),
             timeout=Duration.seconds(60),
             memory_size=256,
+            environment={
+                "BOOTSTRAP_TELEGRAM_BOT_TOKEN": telegram_bot_token,
+                "BOOTSTRAP_TELEGRAM_ADMIN_USER_ID": telegram_admin_user_id,
+            },
         )
         bootstrap_fn.add_to_role_policy(
             iam.PolicyStatement(
@@ -447,8 +454,7 @@ class RouterStack(Stack):
             service_token=bootstrap_provider.service_token,
             properties={
                 "PhysicalResourceId": namer.name("telegram-bootstrap"),
-                "TelegramBotToken": telegram_bot_token_parameter.value_as_string,
-                "TelegramAdminUserId": telegram_admin_user_id_parameter.value_as_string,
+                "BootstrapConfigVersion": bootstrap_config_version,
                 "TelegramTokenSecretId": telegram_token_secret_name,
                 "WebhookSecretId": webhook_secret_name,
                 "IdentityTableName": self.identity_table.table_name,
@@ -489,7 +495,8 @@ class RouterStack(Stack):
                     "CDK-generated DynamoDB/KMS permissions and the runtime endpoint "
                     "sub-resource path require documented wildcards.",
                     applies_to=[
-                        "Resource::<Runtime99E3DDFA.AgentRuntimeArn>/*",
+                        f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent')}*",
+                        f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/{namer.runtime_name('openclaw_agent_v2')}*",
                         *[f"Resource::{secret_arn}" for secret_arn in secret_resource_arns],
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         f"Resource::arn:aws:s3:::{user_files_bucket_name}/*/_uploads/*",

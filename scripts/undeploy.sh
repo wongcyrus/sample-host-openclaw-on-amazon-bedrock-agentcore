@@ -2,7 +2,7 @@
 # undeploy.sh — CDK teardown for OpenClaw on Bedrock AgentCore.
 #
 # Usage:
-#   ./scripts/undeploy.sh                               # destroy deployable stacks, keep security resources
+#   ./scripts/undeploy.sh                               # destroy deployable stacks, keep security resources (defaults to .env.dev when present)
 #   ./scripts/undeploy.sh --all                         # also destroy OpenClawSecurity
 #   ./scripts/undeploy.sh --delete-user-files-bucket    # also delete retained user-files bucket
 #   ./scripts/undeploy.sh --all --delete-user-files-bucket
@@ -22,6 +22,7 @@ Usage:
   ./scripts/undeploy.sh [--env <name>] [--all] [--delete-user-files-bucket]
 
 Options:
+  default                     Prefer .env.dev when present, otherwise fall back to .env.
   --env <name>                Load .env.<name> (for example .env.dev or .env.prod)
                               and require OPENCLAW_ENV_SUFFIX to match that name.
   --all                       Also destroy OpenClawSecurity.
@@ -207,6 +208,17 @@ activate_venv() {
   fi
 }
 
+assign_stack_names() {
+  STACK_VPC="$(with_suffix OpenClawVpc)"
+  STACK_SECURITY="$(with_suffix OpenClawSecurity)"
+  STACK_GUARDRAILS="$(with_suffix OpenClawGuardrails)"
+  STACK_OBSERVABILITY="$(with_suffix OpenClawObservability)"
+  STACK_AGENTCORE="$(with_suffix OpenClawAgentCore)"
+  STACK_ROUTER="$(with_suffix OpenClawRouter)"
+  STACK_CRON="$(with_suffix OpenClawCron)"
+  STACK_TOKEN_MONITORING="$(with_suffix OpenClawTokenMonitoring)"
+}
+
 stack_exists() {
   aws cloudformation describe-stacks \
     --region "$REGION" \
@@ -268,6 +280,51 @@ wait_for_stack_delete() {
 
   echo "ERROR: Timed out waiting for $stack_name to delete."
   return 1
+}
+
+cleanup_retained_guardrail() {
+  local guardrail_identifier="$1"
+  local output=""
+
+  if [ -z "$guardrail_identifier" ] || [ "$guardrail_identifier" = "None" ]; then
+    return 0
+  fi
+
+  output="$(
+    aws bedrock get-guardrail \
+      --region "$REGION" \
+      --guardrail-identifier "$guardrail_identifier" \
+      --guardrail-version DRAFT 2>&1
+  )" || true
+
+  if printf '%s' "$output" | grep -q 'ResourceNotFoundException'; then
+    return 0
+  fi
+
+  if [ -n "$output" ] && printf '%s' "$output" | grep -qE 'Exception|Error'; then
+    echo "WARNING: Unable to inspect retained Bedrock guardrail $guardrail_identifier."
+    echo "$output"
+    return 0
+  fi
+
+  output="$(
+    aws bedrock delete-guardrail \
+      --region "$REGION" \
+      --guardrail-identifier "$guardrail_identifier" 2>&1
+  )" || true
+
+  if [ -z "$output" ] || ! printf '%s' "$output" | grep -qE 'Exception|Error'; then
+    echo "Deleted retained Bedrock guardrail: $guardrail_identifier"
+    return 0
+  fi
+
+  if printf '%s' "$output" | grep -q 'ResourceNotFoundException'; then
+    return 0
+  fi
+
+  echo "WARNING: Stack deleted, but retained Bedrock guardrail $guardrail_identifier still needs manual cleanup."
+  echo "$output"
+  return 0
 }
 
 list_agentcore_enis() {
@@ -534,6 +591,77 @@ destroy_agentcore_stack() {
   return "$destroy_exit"
 }
 
+destroy_guardrails_stack() {
+  local status=""
+  local guardrail_identifier=""
+  local -a retain_resources=()
+
+  if ! stack_exists "$STACK_GUARDRAILS"; then
+    return 0
+  fi
+
+  echo "Destroying stack: $STACK_GUARDRAILS"
+  cd "$PROJECT_DIR"
+  activate_venv
+  guardrail_identifier="$(get_stack_output_value "$STACK_GUARDRAILS" "GuardrailId")"
+  if [ -z "$guardrail_identifier" ] || [ "$guardrail_identifier" = "None" ]; then
+    guardrail_identifier=$(get_stack_resource_id \
+      "$STACK_GUARDRAILS" \
+      "StackResources[?ResourceType=='AWS::Bedrock::Guardrail' && contains(LogicalResourceId, 'ContentGuardrail')].PhysicalResourceId | [0]")
+  fi
+
+  set +e
+  cdk destroy "$STACK_GUARDRAILS" --force --exclusively
+  local destroy_exit=$?
+  set -e
+
+  if [ "$destroy_exit" -eq 0 ]; then
+    return 0
+  fi
+
+  if ! stack_exists "$STACK_GUARDRAILS"; then
+    return 0
+  fi
+
+  status=$(aws cloudformation describe-stacks \
+    --region "$REGION" \
+    --stack-name "$STACK_GUARDRAILS" \
+    --query 'Stacks[0].StackStatus' \
+    --output text 2>/dev/null || true)
+
+  if [ "$status" = "DELETE_FAILED" ]; then
+    local guardrail_logical_id=""
+    local guardrail_version_logical_id=""
+
+    guardrail_logical_id=$(get_stack_resource_id \
+      "$STACK_GUARDRAILS" \
+      "StackResources[?ResourceType=='AWS::Bedrock::Guardrail' && contains(LogicalResourceId, 'ContentGuardrail')].LogicalResourceId | [0]")
+    guardrail_version_logical_id=$(get_stack_resource_id \
+      "$STACK_GUARDRAILS" \
+      "StackResources[?ResourceType=='AWS::Bedrock::GuardrailVersion' && contains(LogicalResourceId, 'ContentGuardrailVersion')].LogicalResourceId | [0]")
+
+    if [ -n "$guardrail_version_logical_id" ] && [ "$guardrail_version_logical_id" != "None" ]; then
+      retain_resources+=("$guardrail_version_logical_id")
+    fi
+    if [ -n "$guardrail_logical_id" ] && [ "$guardrail_logical_id" != "None" ]; then
+      retain_resources+=("$guardrail_logical_id")
+    fi
+
+    if [ "${#retain_resources[@]}" -gt 0 ]; then
+      echo "$STACK_GUARDRAILS is stuck on Bedrock guardrail cleanup; retaining ${retain_resources[*]} and retrying stack deletion."
+      aws cloudformation delete-stack \
+        --region "$REGION" \
+        --stack-name "$STACK_GUARDRAILS" \
+        --retain-resources "${retain_resources[@]}"
+      wait_for_stack_delete "$STACK_GUARDRAILS"
+      cleanup_retained_guardrail "$guardrail_identifier"
+      return 0
+    fi
+  fi
+
+  return "$destroy_exit"
+}
+
 delete_user_files_bucket() {
   local bucket_name
   bucket_name="$(with_suffix "openclaw-user-files-${ACCOUNT}-${REGION}")"
@@ -579,18 +707,55 @@ delete_user_files_bucket() {
   aws s3api delete-bucket --bucket "$bucket_name" --region "$REGION"
 }
 
+selected_stack_group_exists() {
+  local stack_name
+  for stack_name in \
+    "$STACK_VPC" \
+    "$STACK_SECURITY" \
+    "$STACK_GUARDRAILS" \
+    "$STACK_OBSERVABILITY" \
+    "$STACK_AGENTCORE" \
+    "$STACK_ROUTER" \
+    "$STACK_CRON" \
+    "$STACK_TOKEN_MONITORING"; do
+    if stack_exists "$stack_name"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+maybe_fallback_unsuffixed_prod() {
+  if [ "${OPENCLAW_ENV_NAME:-}" != "prod" ]; then
+    return 0
+  fi
+
+  if [ "${OPENCLAW_ENV_SUFFIX:-}" != "prod" ]; then
+    return 0
+  fi
+
+  if selected_stack_group_exists; then
+    return 0
+  fi
+
+  OPENCLAW_ENV_SUFFIX=""
+  export OPENCLAW_ENV_SUFFIX
+  assign_stack_names
+
+  if selected_stack_group_exists; then
+    echo "INFO: No *-prod stacks found. Falling back to unsuffixed OpenClaw stacks for prod teardown."
+  else
+    OPENCLAW_ENV_SUFFIX="prod"
+    export OPENCLAW_ENV_SUFFIX
+    assign_stack_names
+  fi
+}
+
 use_project_node
 ensure_python_venv
 OPENCLAW_ENV_SUFFIX="$(resolve_env_suffix "$PROJECT_DIR")"
 export OPENCLAW_ENV_SUFFIX
-STACK_VPC="$(with_suffix OpenClawVpc)"
-STACK_SECURITY="$(with_suffix OpenClawSecurity)"
-STACK_GUARDRAILS="$(with_suffix OpenClawGuardrails)"
-STACK_OBSERVABILITY="$(with_suffix OpenClawObservability)"
-STACK_AGENTCORE="$(with_suffix OpenClawAgentCore)"
-STACK_ROUTER="$(with_suffix OpenClawRouter)"
-STACK_CRON="$(with_suffix OpenClawCron)"
-STACK_TOKEN_MONITORING="$(with_suffix OpenClawTokenMonitoring)"
+assign_stack_names
 
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
 REGION="${CDK_DEFAULT_REGION:-}"
@@ -614,6 +779,7 @@ export CDK_DEFAULT_ACCOUNT="$ACCOUNT"
 export CDK_DEFAULT_REGION="$REGION"
 
 preflight
+maybe_fallback_unsuffixed_prod
 
 VPC_ID=""
 if stack_exists "$STACK_VPC"; then
@@ -648,7 +814,8 @@ else
   stop_agentcore_runtime_sessions
   destroy_stack_group "$STACK_ROUTER" "$STACK_CRON" "$STACK_TOKEN_MONITORING"
   destroy_agentcore_stack
-  destroy_stack_group "$STACK_GUARDRAILS" "$STACK_OBSERVABILITY"
+  destroy_guardrails_stack
+  destroy_stack_group "$STACK_OBSERVABILITY"
 
   if stack_exists "$STACK_VPC"; then
     wait_for_agentcore_enis "$VPC_ID"

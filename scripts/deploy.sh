@@ -7,7 +7,7 @@
 #   Phase 3: CDK deploys dependent stacks (Router, Cron, TokenMonitoring)
 #
 # Usage:
-#   ./scripts/deploy.sh                  # full 3-phase deploy
+#   ./scripts/deploy.sh                  # full 3-phase deploy (defaults to .env.dev when present)
 #   ./scripts/deploy.sh --cdk-only       # all CDK phases only
 #   ./scripts/deploy.sh --runtime-only   # runtime stack only (Phase 2)
 #   ./scripts/deploy.sh --phase1         # Phase 1 only
@@ -43,6 +43,7 @@ Usage:
   ./scripts/deploy.sh [--env <name>] [--cdk-only|--runtime-only|--phase1|--phase3]
 
 Options:
+  default            Prefer .env.dev when present, otherwise fall back to .env.
   --env <name>       Load .env.<name> (for example .env.dev or .env.prod) and
                      require OPENCLAW_ENV_SUFFIX to match that name.
   --phase1           Deploy foundation stacks only.
@@ -472,20 +473,11 @@ fi
 if [ -n "$RESOLVED_AVAILABILITY_ZONES_JSON" ]; then
   CDK_DEPLOY_FLAGS+=(-c "availability_zones=$RESOLVED_AVAILABILITY_ZONES_JSON")
 fi
-ROUTER_CDK_DEPLOY_FLAGS=("${CDK_DEPLOY_FLAGS[@]}")
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   telegram_setup_attempted=1
-  ROUTER_CDK_DEPLOY_FLAGS+=(
-    --parameters
-    "${STACK_ROUTER}:TelegramBotToken=${TELEGRAM_BOT_TOKEN}"
-  )
 fi
 if [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
   telegram_setup_attempted=1
-  ROUTER_CDK_DEPLOY_FLAGS+=(
-    --parameters
-    "${STACK_ROUTER}:TelegramAdminUserId=${TELEGRAM_ADMIN_USER_ID}"
-  )
 fi
 
 activate_venv() {
@@ -538,7 +530,7 @@ phase3_cdk() {
     "$STACK_ROUTER" \
     "$STACK_CRON" \
     "$STACK_TOKEN_MONITORING" \
-    "${ROUTER_CDK_DEPLOY_FLAGS[@]}"
+    "${CDK_DEPLOY_FLAGS[@]}"
 
   echo "  Phase 3 complete."
   echo ""
@@ -569,7 +561,7 @@ esac
 echo "=== Deploy complete ==="
 echo ""
 if [ "$telegram_setup_attempted" -eq 1 ]; then
-  echo "Telegram bootstrap was requested via Router custom resource parameters."
+  echo "Telegram bootstrap was requested via the deploy-loaded environment."
 else
   echo "Telegram bootstrap was skipped."
   echo "Add TELEGRAM_BOT_TOKEN and/or TELEGRAM_ADMIN_USER_ID to .env to include it in deployment."

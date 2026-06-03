@@ -73,8 +73,6 @@ agentcore_stack = AgentCoreStack(
 router_stack = RouterStack(
     app,
     namer.stack("OpenClawRouter"),
-    runtime_arn=agentcore_stack.runtime_arn,
-    runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
     gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
     gateway_token_secret_arn=security_stack.gateway_token_secret.secret_arn,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
@@ -102,8 +100,6 @@ _identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_t
 cron_stack = CronStack(
     app,
     namer.stack("OpenClawCron"),
-    runtime_arn=agentcore_stack.runtime_arn,
-    runtime_endpoint_id=agentcore_stack.runtime_endpoint_id,
     identity_table_name=_identity_table_name,
     identity_table_arn=_identity_table_arn,
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
