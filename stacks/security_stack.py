@@ -35,6 +35,7 @@ class SecurityStack(Stack):
         kms_client = boto3.client("kms", region_name=region)
         secrets_client = boto3.client("secretsmanager", region_name=region)
         cognito_client = boto3.client("cognito-idp", region_name=region)
+        cf_client = boto3.client("cloudformation", region_name=region)
         cmk_alias_name = namer.name("openclaw/secrets")
         gateway_token_secret_name = namer.name("openclaw/gateway-token")
         webhook_secret_name = namer.name("openclaw/webhook-secret")
@@ -42,34 +43,36 @@ class SecurityStack(Stack):
         user_pool_name = namer.name("openclaw-identity-pool")
         user_pool_client_name = namer.name("openclaw-proxy")
 
-        # --- KMS CMK for Secrets Manager ----------------------------------
+        is_redeploy = False
         try:
-            cmk_metadata = kms_client.describe_key(KeyId=f"alias/{cmk_alias_name}")["KeyMetadata"]
-            self.cmk = kms.Key.from_key_arn(self, "SecretsCmk", cmk_metadata["Arn"])
-            cmk_created = False
-            Annotations.of(self).add_info(f"Reusing existing KMS key alias: alias/{cmk_alias_name}")
-        except ClientError as err:
-            error_code = str(err.response.get("Error", {}).get("Code", ""))
-            if error_code in {"NotFoundException", "InvalidArnException"}:
-                self.cmk = kms.Key(
-                    self,
-                    "SecretsCmk",
-                    alias=cmk_alias_name,
-                    description="CMK for OpenClaw secrets encryption",
-                    enable_key_rotation=True,
-                    removal_policy=stateful_removal_policy(self),
-                )
-                cmk_created = True
-            else:
-                raise ValueError(
-                    "Failed to determine whether the secrets KMS key already exists. "
-                    f"Alias=alias/{cmk_alias_name}. Fix the KMS lookup error: {error_code}"
-                ) from err
-        except (NoCredentialsError, EndpointConnectionError) as err:
-            raise ValueError(
-                "Failed to determine whether the secrets KMS key already exists because "
-                "AWS credentials or the KMS endpoint are unavailable."
-            ) from err
+            cf_client.describe_stacks(StackName=self.stack_name)
+            is_redeploy = True
+        except Exception:
+            is_redeploy = False
+
+        # --- KMS CMK for Secrets Manager ----------------------------------
+        cmk_exists = False
+        cmk_created = False
+        if not is_redeploy:
+            try:
+                cmk_metadata = kms_client.describe_key(KeyId=f"alias/{cmk_alias_name}")["KeyMetadata"]
+                self.cmk = kms.Key.from_key_arn(self, "SecretsCmk", cmk_metadata["Arn"])
+                cmk_created = False
+                cmk_exists = True
+                Annotations.of(self).add_info(f"Reusing existing KMS key alias: alias/{cmk_alias_name}")
+            except Exception:
+                pass
+
+        if not cmk_exists:
+            self.cmk = kms.Key(
+                self,
+                "SecretsCmk",
+                alias=cmk_alias_name,
+                description="CMK for OpenClaw secrets encryption",
+                enable_key_rotation=True,
+                removal_policy=stateful_removal_policy(self),
+            )
+            cmk_created = True
 
         # Allow CloudWatch Alarms to publish to KMS-encrypted SNS topics
         if cmk_created:
@@ -91,39 +94,33 @@ class SecurityStack(Stack):
         created_secrets = []
 
         def resolve_secret(secret_id: str, secret_name: str, description: str, password_length: int):
-            try:
-                secret_description = secrets_client.describe_secret(SecretId=secret_name)
-                Annotations.of(self).add_info(f"Reusing existing secret: {secret_name}")
-                return secretsmanager.Secret.from_secret_complete_arn(
-                    self,
-                    secret_id,
-                    secret_complete_arn=secret_description["ARN"],
-                )
-            except ClientError as err:
-                error_code = str(err.response.get("Error", {}).get("Code", ""))
-                if error_code == "ResourceNotFoundException":
-                    secret = secretsmanager.Secret(
+            secret_exists = False
+            if not is_redeploy:
+                try:
+                    secret_description = secrets_client.describe_secret(SecretId=secret_name)
+                    secret_exists = True
+                    Annotations.of(self).add_info(f"Reusing existing secret: {secret_name}")
+                    return secretsmanager.Secret.from_secret_complete_arn(
                         self,
                         secret_id,
-                        secret_name=secret_name,
-                        description=description,
-                        encryption_key=self.cmk,
-                        generate_secret_string=secretsmanager.SecretStringGenerator(
-                            password_length=password_length,
-                            exclude_punctuation=True,
-                        ),
+                        secret_complete_arn=secret_description["ARN"],
                     )
-                    created_secrets.append(secret)
-                    return secret
-                raise ValueError(
-                    "Failed to determine whether the secret already exists. "
-                    f"Secret={secret_name}. Fix the Secrets Manager lookup error: {error_code}"
-                ) from err
-            except (NoCredentialsError, EndpointConnectionError) as err:
-                raise ValueError(
-                    "Failed to determine whether the secret already exists because "
-                    "AWS credentials or the Secrets Manager endpoint are unavailable."
-                ) from err
+                except Exception:
+                    pass
+
+            secret = secretsmanager.Secret(
+                self,
+                secret_id,
+                secret_name=secret_name,
+                description=description,
+                encryption_key=self.cmk,
+                generate_secret_string=secretsmanager.SecretStringGenerator(
+                    password_length=password_length,
+                    exclude_punctuation=True,
+                ),
+            )
+            created_secrets.append(secret)
+            return secret
 
         self.gateway_token_secret = resolve_secret(
             "GatewayTokenSecret",
@@ -157,42 +154,35 @@ class SecurityStack(Stack):
             cloudtrail_bucket_name = namer.name(
                 f"openclaw-cloudtrail-{account}-{region}"
             )
-            s3_client = boto3.client("s3", region_name=region)
-            try:
-                s3_client.head_bucket(Bucket=cloudtrail_bucket_name)
-                trail_bucket = s3.Bucket.from_bucket_name(
-                    self,
-                    "CloudTrailBucket",
-                    cloudtrail_bucket_name,
-                )
-                Annotations.of(self).add_info(
-                    f"Reusing existing CloudTrail bucket: {cloudtrail_bucket_name}"
-                )
-            except ClientError as err:
-                error_code = str(err.response.get("Error", {}).get("Code", ""))
-                status_code = int(err.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
-                if error_code in {"404", "NoSuchBucket", "NotFound"} or status_code == 404:
-                    trail_bucket = s3.Bucket(
+            bucket_exists = False
+            if not is_redeploy:
+                s3_client = boto3.client("s3", region_name=region)
+                try:
+                    s3_client.head_bucket(Bucket=cloudtrail_bucket_name)
+                    trail_bucket = s3.Bucket.from_bucket_name(
                         self,
                         "CloudTrailBucket",
-                        bucket_name=cloudtrail_bucket_name,
-                        encryption=s3.BucketEncryption.S3_MANAGED,
-                        enforce_ssl=True,
-                        block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-                        versioned=True,
-                        removal_policy=stateful_removal_policy(self),
-                        auto_delete_objects=auto_delete_bucket_objects(self),
+                        cloudtrail_bucket_name,
                     )
-                else:
-                    raise ValueError(
-                        "Failed to determine whether the CloudTrail bucket already exists. "
-                        f"Bucket={cloudtrail_bucket_name}. Fix the S3 lookup error: {error_code or status_code}"
-                    ) from err
-            except (NoCredentialsError, EndpointConnectionError) as err:
-                raise ValueError(
-                    "Failed to determine whether the CloudTrail bucket already exists because "
-                    "AWS credentials or the S3 endpoint are unavailable."
-                ) from err
+                    bucket_exists = True
+                    Annotations.of(self).add_info(
+                        f"Reusing existing CloudTrail bucket: {cloudtrail_bucket_name}"
+                    )
+                except Exception:
+                    pass
+
+            if not bucket_exists:
+                trail_bucket = s3.Bucket(
+                    self,
+                    "CloudTrailBucket",
+                    bucket_name=cloudtrail_bucket_name,
+                    encryption=s3.BucketEncryption.S3_MANAGED,
+                    enforce_ssl=True,
+                    block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+                    versioned=True,
+                    removal_policy=stateful_removal_policy(self),
+                    auto_delete_objects=auto_delete_bucket_objects(self),
+                )
 
             trail_log_group = logs.LogGroup(
                 self,
@@ -213,30 +203,59 @@ class SecurityStack(Stack):
             )
 
         # --- Cognito User Pool (admin-provisioned identities) ---------------
-        try:
-            paginator = cognito_client.get_paginator("list_user_pools")
-            existing_user_pool_id = None
-            for page in paginator.paginate(MaxResults=60):
-                for user_pool in page.get("UserPools", []):
-                    if user_pool.get("Name") == user_pool_name:
-                        existing_user_pool_id = user_pool["Id"]
+        user_pool_exists = False
+        user_pool_created = False
+        if not is_redeploy:
+            try:
+                paginator = cognito_client.get_paginator("list_user_pools")
+                existing_user_pool_id = None
+                for page in paginator.paginate(MaxResults=60):
+                    for user_pool in page.get("UserPools", []):
+                        if user_pool.get("Name") == user_pool_name:
+                            existing_user_pool_id = user_pool["Id"]
+                            break
+                    if existing_user_pool_id:
                         break
                 if existing_user_pool_id:
-                    break
-        except ClientError as err:
-            error_code = str(err.response.get("Error", {}).get("Code", ""))
-            raise ValueError(
-                "Failed to determine whether the Cognito user pool already exists. "
-                f"UserPool={user_pool_name}. Fix the Cognito lookup error: {error_code}"
-            ) from err
-        except (NoCredentialsError, EndpointConnectionError) as err:
-            raise ValueError(
-                "Failed to determine whether the Cognito user pool already exists because "
-                "AWS credentials or the Cognito endpoint are unavailable."
-            ) from err
+                    user_pool_exists = True
+                    Annotations.of(self).add_info(f"Reusing existing Cognito user pool: {user_pool_name}")
+                    self.user_pool = cognito.UserPool.from_user_pool_id(
+                        self,
+                        "IdentityPool",
+                        user_pool_id=existing_user_pool_id,
+                    )
+                    paginator = cognito_client.get_paginator("list_user_pool_clients")
+                    existing_client_id = None
+                    for page in paginator.paginate(
+                        UserPoolId=existing_user_pool_id,
+                        MaxResults=60,
+                    ):
+                        for user_pool_client in page.get("UserPoolClients", []):
+                            if user_pool_client.get("ClientName") == user_pool_client_name:
+                                existing_client_id = user_pool_client["ClientId"]
+                                break
+                        if existing_client_id:
+                            break
 
-        user_pool_created = existing_user_pool_id is None
-        if user_pool_created:
+                    if existing_client_id is None:
+                        user_pool_client = cognito.CfnUserPoolClient(
+                            self,
+                            "ProxyClient",
+                            user_pool_id=existing_user_pool_id,
+                            client_name=user_pool_client_name,
+                            explicit_auth_flows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+                            generate_secret=False,
+                        )
+                        self.user_pool_client_id = user_pool_client.ref
+                    else:
+                        Annotations.of(self).add_info(
+                            f"Reusing existing Cognito user pool client: {user_pool_client_name}"
+                        )
+                        self.user_pool_client_id = existing_client_id
+            except Exception:
+                pass
+
+        if not user_pool_exists:
             self.user_pool = cognito.UserPool(
                 self,
                 "IdentityPool",
@@ -253,6 +272,7 @@ class SecurityStack(Stack):
                 removal_policy=stateful_removal_policy(self),
                 account_recovery=cognito.AccountRecovery.NONE,
             )
+            user_pool_created = True
 
             self.user_pool_client = self.user_pool.add_client(
                 "ProxyClient",
@@ -264,53 +284,6 @@ class SecurityStack(Stack):
             )
             self.user_pool_id = self.user_pool.user_pool_id
             self.user_pool_client_id = self.user_pool_client.user_pool_client_id
-        else:
-            Annotations.of(self).add_info(f"Reusing existing Cognito user pool: {user_pool_name}")
-            self.user_pool = cognito.UserPool.from_user_pool_id(
-                self,
-                "IdentityPool",
-                user_pool_id=existing_user_pool_id,
-            )
-            try:
-                paginator = cognito_client.get_paginator("list_user_pool_clients")
-                existing_client_id = None
-                for page in paginator.paginate(
-                    UserPoolId=existing_user_pool_id,
-                    MaxResults=60,
-                ):
-                    for user_pool_client in page.get("UserPoolClients", []):
-                        if user_pool_client.get("ClientName") == user_pool_client_name:
-                            existing_client_id = user_pool_client["ClientId"]
-                            break
-                    if existing_client_id:
-                        break
-            except ClientError as err:
-                error_code = str(err.response.get("Error", {}).get("Code", ""))
-                raise ValueError(
-                    "Failed to determine whether the Cognito user pool client already exists. "
-                    f"UserPoolClient={user_pool_client_name}. Fix the Cognito lookup error: {error_code}"
-                ) from err
-            except (NoCredentialsError, EndpointConnectionError) as err:
-                raise ValueError(
-                    "Failed to determine whether the Cognito user pool client already exists because "
-                    "AWS credentials or the Cognito endpoint are unavailable."
-                ) from err
-
-            if existing_client_id is None:
-                user_pool_client = cognito.CfnUserPoolClient(
-                    self,
-                    "ProxyClient",
-                    user_pool_id=existing_user_pool_id,
-                    client_name=user_pool_client_name,
-                    explicit_auth_flows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
-                    generate_secret=False,
-                )
-                self.user_pool_client_id = user_pool_client.ref
-            else:
-                Annotations.of(self).add_info(
-                    f"Reusing existing Cognito user pool client: {user_pool_client_name}"
-                )
-                self.user_pool_client_id = existing_client_id
 
         # Expose Cognito outputs for downstream stacks
         self.user_pool_id = self.user_pool.user_pool_id

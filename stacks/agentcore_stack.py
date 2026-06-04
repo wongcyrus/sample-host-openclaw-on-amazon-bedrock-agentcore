@@ -57,6 +57,13 @@ class AgentCoreStack(Stack):
         suffix = namer.suffix
         is_dev = suffix == "dev"
         region = Stack.of(self).region
+        cf_client = boto3.client("cloudformation", region_name=region)
+        is_redeploy = False
+        try:
+            cf_client.describe_stacks(StackName=self.stack_name)
+            is_redeploy = True
+        except Exception:
+            is_redeploy = False
         account = Stack.of(self).account
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         execution_role_name = namer.name(f"openclaw-agentcore-execution-role-{region}")
@@ -330,6 +337,9 @@ class AgentCoreStack(Stack):
         if reuse_existing_bucket_normalized in {"1", "true", "yes", "on"}:
             reuse_existing_bucket = True
         elif reuse_existing_bucket_normalized in {"0", "false", "no", "off"}:
+            reuse_existing_bucket = False
+        elif is_redeploy:
+            # Standard redeployment must define the S3 bucket resource to avoid deletion
             reuse_existing_bucket = False
         else:
             s3_client = boto3.client("s3", region_name=region)
