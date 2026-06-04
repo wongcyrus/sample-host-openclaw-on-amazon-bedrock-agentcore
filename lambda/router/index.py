@@ -735,10 +735,18 @@ def _extract_text_from_content_blocks(text):
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
             # Not a valid content block array — check if it looks like truncated
-            # content blocks (e.g., '[{"type":' ...) and strip them
+            # content blocks (e.g., '[{"type":' ...) and try to extract text via regex
             remainder = result[pos:]
             if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
-                # Truncated content block JSON — skip the rest
+                text_matches = re.findall(r'"text"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', remainder)
+                if text_matches:
+                    decoded_texts = []
+                    for m in text_matches:
+                        try:
+                            decoded_texts.append(json.loads(f'"{m}"'))
+                        except Exception:
+                            decoded_texts.append(m)
+                    rebuilt.append("".join(decoded_texts))
                 break
             rebuilt.append("[")
             i = pos + 1
@@ -1144,7 +1152,10 @@ def _fetch_s3_image(s3_key: str, namespace: str):
         logger.error("Rejected S3 screenshot key outside user namespace: %s (expected prefix: %s)", s3_key, expected_prefix)
         return None
     try:
-        bucket = os.environ["S3_USER_FILES_BUCKET"]
+        bucket = os.environ.get("S3_USER_FILES_BUCKET") or os.environ.get("USER_FILES_BUCKET", "")
+        if not bucket:
+            logger.error("S3 bucket name not configured (S3_USER_FILES_BUCKET/USER_FILES_BUCKET) — cannot fetch screenshot")
+            return None
         resp = s3_client.get_object(Bucket=bucket, Key=s3_key)
         return resp["Body"].read()
     except Exception as e:

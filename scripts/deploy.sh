@@ -782,21 +782,6 @@ phase1_cdk() {
   echo ""
 }
 
-phase1_cdk_without_security() {
-  echo "=== Phase 1: CDK foundation stacks (security deferred for migration) ==="
-  cd "$PROJECT_DIR"
-  activate_venv
-
-  cdk deploy \
-    "$STACK_VPC" \
-    "$STACK_GUARDRAILS" \
-    "$STACK_OBSERVABILITY" \
-    "${CDK_DEPLOY_FLAGS[@]}"
-
-  echo "  Phase 1 (without security) complete."
-  echo ""
-}
-
 # --- Phase 2: CDK runtime deploy ---
 phase2_runtime() {
   echo "=== Phase 2: AgentCore runtime stack ==="
@@ -831,24 +816,6 @@ phase3_cdk() {
   echo ""
 }
 
-phase4_security() {
-  echo "=== Phase 4: Security stack ==="
-  cd "$PROJECT_DIR"
-  activate_venv
-
-  cdk deploy \
-    "$STACK_SECURITY" \
-    "${CDK_DEPLOY_FLAGS[@]}"
-
-  echo "  Phase 4 complete."
-  echo ""
-}
-
-EXISTING_SECURITY_STACK=0
-if stack_exists "$STACK_SECURITY"; then
-  EXISTING_SECURITY_STACK=1
-fi
-
 case "$MODE" in
   --phase1)
     phase1_cdk
@@ -859,31 +826,10 @@ case "$MODE" in
   --phase3)
     phase3_cdk
     ;;
-  --cdk-only)
-    if [ "$EXISTING_SECURITY_STACK" -eq 1 ]; then
-      echo "INFO: Existing security stack detected; deploying consumer stacks before security to migrate away from legacy exports."
-      phase1_cdk_without_security
-      phase2_runtime
-      phase3_cdk
-      phase4_security
-    else
-      phase1_cdk
-      phase2_runtime
-      phase3_cdk
-    fi
-    ;;
-  *)
-    if [ "$EXISTING_SECURITY_STACK" -eq 1 ]; then
-      echo "INFO: Existing security stack detected; deploying consumer stacks before security to migrate away from legacy exports."
-      phase1_cdk_without_security
-      phase2_runtime
-      phase3_cdk
-      phase4_security
-    else
-      phase1_cdk
-      phase2_runtime
-      phase3_cdk
-    fi
+  --cdk-only|*)
+    phase1_cdk
+    phase2_runtime
+    phase3_cdk
     ;;
 esac
 
