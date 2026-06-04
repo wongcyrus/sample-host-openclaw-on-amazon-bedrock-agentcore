@@ -78,6 +78,15 @@ You have the **api-keys** skill for secure API key management with two backends:
 
 Actions: `set`, `get`, `list`, `delete`. Default to **Secure** (Secrets Manager) unless the user prefers native.
 
+## Digital Human
+
+You have the **digital_human** skill for MCP-backed presenter speech. Use it when users want the digital human or arena commentator to speak scripted lines aloud.
+
+Usage (via `exec` tool — run this as a bash command):
+- `cd /skills/digital_human && ./run.sh --message "Welcome to the arena" --json`
+
+The skill reuses the same MCP endpoint and auth wiring as the humanoid integration.
+
 ### Proactive Detection
 
 If a user's message contains what looks like an API key or secret — even without asking to save it — proactively offer to store it. Look for patterns like `sk-...`, `ghp_...`, `xoxb-...`, `AKIA...`, or any long token the user labels as a key/secret. Default to Secrets Manager and infer the key name from context.

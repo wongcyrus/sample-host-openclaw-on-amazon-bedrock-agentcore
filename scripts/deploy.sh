@@ -347,8 +347,8 @@ validate_required_settings() {
     errors=$((errors + 1))
   fi
 
-  if [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ] && ! [[ "${TELEGRAM_ADMIN_USER_ID}" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: TELEGRAM_ADMIN_USER_ID must be numeric. Got: ${TELEGRAM_ADMIN_USER_ID}"
+  if [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ] && ! validate_numeric_csv "${TELEGRAM_ADMIN_USER_ID}"; then
+    echo "ERROR: TELEGRAM_ADMIN_USER_ID must contain numeric IDs only (comma-separated is allowed). Got: ${TELEGRAM_ADMIN_USER_ID}"
     errors=$((errors + 1))
   fi
 
@@ -401,6 +401,14 @@ TELEGRAM_SECRET_ID="$(with_suffix 'openclaw/channels/telegram')"
 WEBHOOK_SECRET_ID="$(with_suffix 'openclaw/webhook-secret')"
 IDENTITY_TABLE_NAME="$(with_suffix 'openclaw-identity')"
 telegram_setup_attempted=0
+
+stack_exists() {
+  local stack_name="$1"
+  aws cloudformation describe-stacks \
+    --stack-name "$stack_name" \
+    --region "$REGION" \
+    >/dev/null 2>&1
+}
 
 # Resolve account and region
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
@@ -506,6 +514,21 @@ phase1_cdk() {
   echo ""
 }
 
+phase1_cdk_without_security() {
+  echo "=== Phase 1: CDK foundation stacks (security deferred for migration) ==="
+  cd "$PROJECT_DIR"
+  activate_venv
+
+  cdk deploy \
+    "$STACK_VPC" \
+    "$STACK_GUARDRAILS" \
+    "$STACK_OBSERVABILITY" \
+    "${CDK_DEPLOY_FLAGS[@]}"
+
+  echo "  Phase 1 (without security) complete."
+  echo ""
+}
+
 # --- Phase 2: CDK runtime deploy ---
 phase2_runtime() {
   echo "=== Phase 2: AgentCore runtime stack ==="
@@ -536,6 +559,24 @@ phase3_cdk() {
   echo ""
 }
 
+phase4_security() {
+  echo "=== Phase 4: Security stack ==="
+  cd "$PROJECT_DIR"
+  activate_venv
+
+  cdk deploy \
+    "$STACK_SECURITY" \
+    "${CDK_DEPLOY_FLAGS[@]}"
+
+  echo "  Phase 4 complete."
+  echo ""
+}
+
+EXISTING_SECURITY_STACK=0
+if stack_exists "$STACK_SECURITY"; then
+  EXISTING_SECURITY_STACK=1
+fi
+
 case "$MODE" in
   --phase1)
     phase1_cdk
@@ -547,14 +588,30 @@ case "$MODE" in
     phase3_cdk
     ;;
   --cdk-only)
-    phase1_cdk
-    phase2_runtime
-    phase3_cdk
+    if [ "$EXISTING_SECURITY_STACK" -eq 1 ]; then
+      echo "INFO: Existing security stack detected; deploying consumer stacks before security to migrate away from legacy exports."
+      phase1_cdk_without_security
+      phase2_runtime
+      phase3_cdk
+      phase4_security
+    else
+      phase1_cdk
+      phase2_runtime
+      phase3_cdk
+    fi
     ;;
   *)
-    phase1_cdk
-    phase2_runtime
-    phase3_cdk
+    if [ "$EXISTING_SECURITY_STACK" -eq 1 ]; then
+      echo "INFO: Existing security stack detected; deploying consumer stacks before security to migrate away from legacy exports."
+      phase1_cdk_without_security
+      phase2_runtime
+      phase3_cdk
+      phase4_security
+    else
+      phase1_cdk
+      phase2_runtime
+      phase3_cdk
+    fi
     ;;
 esac
 

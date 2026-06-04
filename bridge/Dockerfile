@@ -147,6 +147,10 @@ RUN chmod +x /skills/agentcore-browser/*.js
 COPY skills/humanoid /skills/humanoid
 RUN chmod +x /skills/humanoid/run.sh
 
+# Copy digital human MCP skill
+COPY skills/digital_human /skills/digital_human
+RUN chmod +x /skills/digital_human/run.sh
+
 # Copy project instructions (CLAUDE.md) so the agent knows about its skills
 COPY CLAUDE.md /app/CLAUDE.md
 

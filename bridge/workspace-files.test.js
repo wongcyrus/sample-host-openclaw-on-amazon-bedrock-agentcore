@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 const {
   WORKSPACE_FILES,
   PROXY_CONTEXT_FILES,
+  DOMAIN_COMMENTATOR_AGENT_ID,
+  COMMUNICATION_MANAGER_AGENT_ID,
   buildAgentWorkspaceDir,
   getAgentWorkspaceS3Candidates,
   getManagedWorkspaceS3Candidates,
@@ -29,6 +31,7 @@ test("robot workspace defaults specialize AGENTS and IDENTITY by robot id", () =
 
   assert.ok(defaults["AGENTS.md"].includes("# robot_2 Agent"));
   assert.ok(defaults["AGENTS.md"].includes("physical unit `robot_2`"));
+  assert.ok(defaults["IDENTITY.md"].includes("robot_2 or 端"));
   assert.ok(defaults["IDENTITY.md"].includes("`robot_2`"));
   assert.ok(defaults["TOOLS.md"].includes("`robot_2`"));
 });
@@ -36,16 +39,50 @@ test("robot workspace defaults specialize AGENTS and IDENTITY by robot id", () =
 test("workspace defaults by agent preserve robot-specific templates", () => {
   const defaultsByAgent = getWorkspaceDefaultsByAgent(
     { humanoidEnabled: true },
-    ["main", "robot_1", "robot_2"],
+    ["main", DOMAIN_COMMENTATOR_AGENT_ID, COMMUNICATION_MANAGER_AGENT_ID, "robot_1", "robot_2"],
   );
 
   assert.ok(defaultsByAgent.main["IDENTITY.md"].includes("HKIIT"));
+  assert.ok(
+    defaultsByAgent[DOMAIN_COMMENTATOR_AGENT_ID]["AGENTS.md"].includes(
+      "Domain Arena Commentator",
+    ),
+  );
+  assert.ok(
+    defaultsByAgent[DOMAIN_COMMENTATOR_AGENT_ID]["TOOLS.md"].includes(
+      "digital_human",
+    ),
+  );
+  assert.ok(
+    defaultsByAgent[COMMUNICATION_MANAGER_AGENT_ID]["IDENTITY.md"].includes(
+      "Mercury",
+    ),
+  );
   assert.ok(defaultsByAgent.robot_1["AGENTS.md"].includes("# robot_1 Agent"));
+  assert.ok(defaultsByAgent.robot_1["IDENTITY.md"].includes("robot_1 or 雲"));
   assert.ok(defaultsByAgent.robot_2["IDENTITY.md"].includes("`robot_2`"));
   assert.notEqual(
     defaultsByAgent.robot_1["AGENTS.md"],
     defaultsByAgent.main["AGENTS.md"],
   );
+});
+
+test("domain commentator workspace defaults are specialized", () => {
+  const defaults = getWorkspaceDefaults({}, DOMAIN_COMMENTATOR_AGENT_ID);
+
+  assert.ok(defaults["AGENTS.md"].includes("domain-commentator Agent"));
+  assert.ok(defaults["IDENTITY.md"].includes("Domain Arena Commentator"));
+  assert.ok(defaults["TOOLS.md"].includes("digital_human"));
+  assert.ok(defaults["SOUL.md"].includes("energetic, precise, and audience-aware"));
+});
+
+test("communication manager workspace defaults are specialized", () => {
+  const defaults = getWorkspaceDefaults({}, COMMUNICATION_MANAGER_AGENT_ID);
+
+  assert.ok(defaults["IDENTITY.md"].includes("Mercury"));
+  assert.ok(defaults["AGENTS.md"].includes("Confirmation Rule"));
+  assert.ok(defaults["TOOLS.md"].includes("digital_human"));
+  assert.ok(defaults["USER.md"].includes("Digital Human skills"));
 });
 
 test("workspace files preserve AGENTS and TOOLS priority", () => {

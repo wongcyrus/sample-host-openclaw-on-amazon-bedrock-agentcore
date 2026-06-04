@@ -51,7 +51,7 @@ for arg in "$@"; do
 done
 
 # ── Telegram notification helper ────────────────────────────────────────────
-TG_CHAT_ID="${E2E_TELEGRAM_CHAT_ID:?Set E2E_TELEGRAM_CHAT_ID}"
+TG_CHAT_ID="$(first_csv_value "${E2E_TELEGRAM_CHAT_ID:?Set E2E_TELEGRAM_CHAT_ID}")"
 send_telegram() {
   local msg="$1"
   local token

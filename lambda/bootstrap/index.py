@@ -66,6 +66,20 @@ def _allowlist_telegram_admin(*, identity_table_name: str, admin_user_id: str) -
     )
 
 
+def _parse_telegram_admin_user_ids(raw_user_ids: str) -> list[str]:
+    user_ids = []
+    for part in raw_user_ids.split(","):
+        user_id = part.strip()
+        if not user_id:
+            continue
+        if not user_id.isdigit():
+            raise ValueError(
+                "TelegramAdminUserId must contain only numeric IDs separated by commas."
+            )
+        user_ids.append(user_id)
+    return user_ids
+
+
 def on_event(event, _context):
     request_type = event["RequestType"]
     props = event["ResourceProperties"]
@@ -92,7 +106,7 @@ def on_event(event, _context):
 
     updated_secret = False
     configured_webhook = False
-    allowlisted_admin = False
+    allowlisted_admin_count = 0
 
     if telegram_bot_token:
         secretsmanager.update_secret(
@@ -112,17 +126,18 @@ def on_event(event, _context):
         configured_webhook = True
 
     if telegram_admin_user_id:
-        _allowlist_telegram_admin(
-            identity_table_name=identity_table_name,
-            admin_user_id=telegram_admin_user_id,
-        )
-        allowlisted_admin = True
+        for admin_user_id in _parse_telegram_admin_user_ids(telegram_admin_user_id):
+            _allowlist_telegram_admin(
+                identity_table_name=identity_table_name,
+                admin_user_id=admin_user_id,
+            )
+            allowlisted_admin_count += 1
 
     LOGGER.info(
-        "Bootstrap complete: secret_updated=%s webhook_configured=%s admin_allowlisted=%s",
+        "Bootstrap complete: secret_updated=%s webhook_configured=%s admin_allowlisted_count=%s",
         updated_secret,
         configured_webhook,
-        allowlisted_admin,
+        allowlisted_admin_count,
     )
 
     return {
@@ -130,6 +145,6 @@ def on_event(event, _context):
         "Data": {
             "TelegramSecretUpdated": str(updated_secret).lower(),
             "TelegramWebhookConfigured": str(configured_webhook).lower(),
-            "TelegramAdminAllowlisted": str(allowlisted_admin).lower(),
+            "TelegramAdminAllowlisted": str(allowlisted_admin_count > 0).lower(),
         },
     }

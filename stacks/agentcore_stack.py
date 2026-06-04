@@ -528,10 +528,10 @@ class AgentCoreStack(Stack):
         runtime_env = {
             "AWS_REGION": region,
             "BEDROCK_MODEL_ID": default_model_id,
-            "GATEWAY_TOKEN_SECRET_ID": gateway_token_secret_name,
+            "GATEWAY_TOKEN_SECRET_ID": gateway_token_secret_arn,
             "COGNITO_USER_POOL_ID": cognito_user_pool_id,
             "COGNITO_CLIENT_ID": cognito_client_id,
-            "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
+            "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_arn,
             "S3_USER_FILES_BUCKET": self.user_files_bucket.bucket_name,
             "WORKSPACE_SYNC_INTERVAL_MS": str(workspace_sync_interval_seconds * 1000),
             "EXECUTION_ROLE_ARN": self.execution_role.role_arn,
@@ -542,7 +542,7 @@ class AgentCoreStack(Stack):
             "IDENTITY_TABLE_NAME": identity_table_name,
             "CRON_LEAD_TIME_MINUTES": str(cron_lead_time_minutes),
             "SUBAGENT_BEDROCK_MODEL_ID": subagent_model_id,
-            "TELEGRAM_CHANNEL_SECRET_ID": telegram_token_secret_name,
+            "TELEGRAM_CHANNEL_SECRET_ID": telegram_token_secret_arn,
             "MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE": managed_workspace_bootstrap_namespace,
             "DASHBOARD_API_PUSH_URL": str(
                 self.node.try_get_context("dashboard_api_push_url") or ""

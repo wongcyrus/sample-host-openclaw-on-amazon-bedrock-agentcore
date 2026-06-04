@@ -169,10 +169,10 @@ You can pull the managed per-agent workspace files to your laptop, edit them loc
 ./scripts/sync-agent-workspace.sh push
 ```
 
-By default, the script uses the `dev` env file, reads `TELEGRAM_ADMIN_USER_ID`, and targets `telegram:<id>` automatically. It stores files in `~/.openclaw-agent-workspaces/<namespace>` using an OpenClaw-style layout:
+By default, the script uses the `dev` env file, reads `TELEGRAM_ADMIN_USER_ID`, and targets the first `telegram:<id>` automatically when that env var contains multiple comma-separated IDs. It stores files in `~/.openclaw-agent-workspaces/<namespace>` using an OpenClaw-style layout:
 
 - workspace-root files such as `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, and `MEMORY.md`
-- per-agent folders such as `robot_1/`, `robot_2/`, and so on
+- per-agent folders such as `domain-commentator/`, `communication-manager/`, `robot_1/`, `robot_2/`, and so on
 
 The workspace-root files map to `s3://.../<namespace>/<FILE>`. Agent folders map to `s3://.../<namespace>/agents/<agent>/<FILE>`. This lets you review and edit the workspace locally in the same shape as the reference OpenClaw workspace. If you need to remove a remote file entirely, run `push --delete-missing` after deleting it locally. Active sessions do not reload these files instantly, so stop the user's current AgentCore session or wait for it to recycle before checking the new behavior.
 
@@ -204,6 +204,8 @@ Examples include:
 
 - `telegram_<your_user_id>/AGENTS.md`
 - `telegram_<your_user_id>/USER.md`
+- `telegram_<your_user_id>/agents/domain-commentator/AGENTS.md`
+- `telegram_<your_user_id>/agents/communication-manager/AGENTS.md`
 - `telegram_<your_user_id>/agents/main/AGENTS.md`
 - `telegram_<your_user_id>/agents/robot_1/AGENTS.md`
 
@@ -338,6 +340,8 @@ These humanoid settings are injected into the **AgentCore runtime** in **Phase 2
 ./scripts/deploy.sh --env dev --runtime-only
 ```
 
+The `domain-commentator` agent uses the bundled `digital_human` MCP skill, and it reuses the same Lambda Function URL, auth mode, and IAM grant as the humanoid MCP integration above. No separate `digital_human_*` CDK settings are needed.
+
 If you keep multiple env files, the scripts load **one file only**:
 
 - default when present: `.env.dev`
@@ -357,7 +361,7 @@ The scripts do **not** merge `.env` with `.env.prod` or `.env.dev`. The selected
 
 For teardown, `undeploy.sh --env prod` has one extra compatibility rule: if no `OpenClaw*-prod` stacks exist, it automatically falls back to the unsuffixed `OpenClaw*` stack set. That keeps legacy unsuffixed prod deployments removable while still letting `prod` be the named environment going forward.
 
-`deploy.sh` now fails fast before deployment if required settings are missing or inconsistent. For example, it rejects a missing `OPENCLAW_ENV_FILE`, a non-numeric `TELEGRAM_ADMIN_USER_ID`, an invalid-looking `TELEGRAM_BOT_TOKEN`, or Telegram bootstrap settings used with a mode that does not deploy the Router stack.
+`deploy.sh` now fails fast before deployment if required settings are missing or inconsistent. For example, it rejects a missing `OPENCLAW_ENV_FILE`, a non-numeric `TELEGRAM_ADMIN_USER_ID` entry, an invalid-looking `TELEGRAM_BOT_TOKEN`, or Telegram bootstrap settings used with a mode that does not deploy the Router stack.
 
 It also fails fast when `OPENCLAW_ENV_SUFFIX` / `environment_suffix` points at a named environment like `dev` but you forgot to select the matching env file.
 
@@ -368,6 +372,8 @@ If you also set these Telegram values, deployment will bootstrap the bot automat
 ```bash
 TELEGRAM_BOT_TOKEN=123456:your-bot-token
 TELEGRAM_ADMIN_USER_ID=123456789
+# or multiple allowlisted Telegram users
+TELEGRAM_ADMIN_USER_ID=123456789,987654321
 ```
 
 That makes `./scripts/deploy.sh` load the selected `.env*` file into the Router bootstrap Lambda environment so the custom resource can do all of the following without a separate setup step:
@@ -609,6 +615,10 @@ All tunable parameters are in `cdk.json`:
 | `session_max_lifetime` | `1800` non-dev default, `600` in `dev` | Per-user session max lifetime (seconds) |
 | `workspace_sync_interval_seconds` | `300` | .openclaw/ S3 sync interval |
 | `managed_workspace_bootstrap_namespace` | `workspace-bootstrap` | Shared S3 prefix for the repo-managed initial managed workspace. `OpenClawAgentCore` uploads `bootstrap/managed-workspace/` here during deploy, and first-run users fall back to it only when their own managed workspace files do not exist yet |
+| `humanoid_mcp_server_url` | `""` | MCP endpoint URL for the bundled humanoid robot skill |
+| `humanoid_mcp_auth_mode` | `"iam"` | MCP auth mode for the humanoid skill: `iam`, `api-key`, or `none` |
+| `humanoid_mcp_function_arn` | `""` | Lambda function ARN for IAM-protected humanoid MCP URLs so CDK can grant invoke permissions |
+| `humanoid_mcp_api_key_header` | `"x-api-key"` | API-key header name for humanoid MCP endpoints when `humanoid_mcp_auth_mode` is `api-key` |
 | `router_lambda_timeout_seconds` | `600` | Router Lambda timeout |
 | `router_lambda_memory_mb` | `256` | Router Lambda memory |
 | `registration_open` | `false` | If `true`, anyone can message the bot. If `false`, only allowlisted users can register |
@@ -954,7 +964,7 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
 
 ### Tools & Skills
 
-The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, sessions, automation). Three custom skills are included:
+The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, sessions, automation). Six custom skills are included:
 
 | Skill | Purpose |
 |---|---|
@@ -963,6 +973,7 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills |
 | `api-keys` | Secure API key management — dual-mode storage with native file-based or AWS Secrets Manager backend (see [API Key Management](#api-key-management)) |
 | `agentcore-browser` | Headless Chromium browser — navigate, screenshot, interact with web pages (optional, see [Browser Support](#browser-support-optional)) |
+| `digital_human` | MCP-backed presenter speech skill for the `domain-commentator` agent |
 
 Five ClawHub community skills are pre-installed at Docker build time:
 
@@ -1046,7 +1057,8 @@ cd lambda/router && python -m pytest test_image_upload.py -v        # image uplo
 cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
 cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
 
-# E2E tests (requires deployed stack + E2E_TELEGRAM_CHAT_ID/E2E_TELEGRAM_USER_ID env vars)
+# E2E tests (requires deployed stack + E2E_TELEGRAM_CHAT_ID/E2E_TELEGRAM_USER_ID env vars;
+# if comma-separated, the first value is used)
 pytest tests/e2e/bot_test.py -v -k smoke               # connectivity + webhook auth
 pytest tests/e2e/bot_test.py -v -k lifecycle            # full message lifecycle
 pytest tests/e2e/bot_test.py -v -k cold_start           # new session creation

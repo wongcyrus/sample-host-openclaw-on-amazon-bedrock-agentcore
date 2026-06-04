@@ -44,6 +44,14 @@ def _with_suffix(base: str, suffix: str) -> str:
     return f"{base}-{suffix}" if suffix else base
 
 
+def _first_csv_value(raw: str) -> str:
+    for part in raw.split(","):
+        value = part.strip()
+        if value:
+            return value
+    return ""
+
+
 @dataclass(frozen=True)
 class E2EConfig:
     region: str
@@ -88,8 +96,8 @@ def load_config() -> E2EConfig:
         raise RuntimeError(f"Cannot read webhook secret: {e}") from e
 
     # Telegram IDs from env vars
-    chat_id = os.environ.get("E2E_TELEGRAM_CHAT_ID", "")
-    user_id = os.environ.get("E2E_TELEGRAM_USER_ID", "")
+    chat_id = _first_csv_value(os.environ.get("E2E_TELEGRAM_CHAT_ID", ""))
+    user_id = _first_csv_value(os.environ.get("E2E_TELEGRAM_USER_ID", ""))
     if not chat_id or not user_id:
         raise RuntimeError(
             "Set E2E_TELEGRAM_CHAT_ID and E2E_TELEGRAM_USER_ID env vars "

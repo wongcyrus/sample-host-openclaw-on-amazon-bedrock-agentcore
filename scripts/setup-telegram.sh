@@ -79,38 +79,40 @@ echo ""
 echo "To find your Telegram user ID, message @userinfobot on Telegram"
 echo "or send any message to your bot — the rejection reply will show your ID."
 echo ""
-TELEGRAM_USER_ID="${TELEGRAM_ADMIN_USER_ID:-}"
-if [ -z "$TELEGRAM_USER_ID" ]; then
-    read -rp "Enter your Telegram user ID (numeric, e.g. 123456789): " TELEGRAM_USER_ID
+TELEGRAM_USER_IDS="${TELEGRAM_ADMIN_USER_ID:-}"
+if [ -z "$TELEGRAM_USER_IDS" ]; then
+    read -rp "Enter Telegram user ID(s) (numeric, comma-separated, e.g. 123456789,987654321): " TELEGRAM_USER_IDS
 fi
 
-# Validate: must be numeric
-if ! [[ "$TELEGRAM_USER_ID" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: Telegram user ID must be numeric. Got: $TELEGRAM_USER_ID"
+# Validate: must be numeric CSV
+if ! validate_numeric_csv "$TELEGRAM_USER_IDS"; then
+    echo "ERROR: Telegram user ID(s) must be numeric. Comma-separated values are allowed. Got: $TELEGRAM_USER_IDS"
     exit 1
 fi
 
 # --- Step 3: Add to allowlist ---
-CHANNEL_KEY="telegram:${TELEGRAM_USER_ID}"
 NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-echo "Adding $CHANNEL_KEY to allowlist..."
-aws dynamodb put-item \
-    --table-name "$TABLE_NAME" \
-    --region "$REGION" \
-    $PROFILE_ARG \
-    --item "{
-        \"PK\": {\"S\": \"ALLOW#${CHANNEL_KEY}\"},
-        \"SK\": {\"S\": \"ALLOW\"},
-        \"channelKey\": {\"S\": \"${CHANNEL_KEY}\"},
-        \"addedAt\": {\"S\": \"${NOW_ISO}\"}
-    }"
+while IFS= read -r telegram_user_id; do
+    CHANNEL_KEY="telegram:${telegram_user_id}"
+    echo "Adding $CHANNEL_KEY to allowlist..."
+    aws dynamodb put-item \
+        --table-name "$TABLE_NAME" \
+        --region "$REGION" \
+        $PROFILE_ARG \
+        --item "{
+            \"PK\": {\"S\": \"ALLOW#${CHANNEL_KEY}\"},
+            \"SK\": {\"S\": \"ALLOW\"},
+            \"channelKey\": {\"S\": \"${CHANNEL_KEY}\"},
+            \"addedAt\": {\"S\": \"${NOW_ISO}\"}
+        }"
+done < <(csv_lines "$TELEGRAM_USER_IDS")
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "  Webhook URL: ${API_URL}webhook/telegram"
-echo "  Allowlisted: $CHANNEL_KEY"
+echo "  Allowlisted IDs: $(csv_lines "$TELEGRAM_USER_IDS" | paste -sd ',' -)"
 echo ""
 echo "You can now message your Telegram bot. The first message will take"
 echo "~4 minutes (container cold start), subsequent messages are fast."

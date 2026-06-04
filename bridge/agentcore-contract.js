@@ -33,6 +33,8 @@ const scopedCreds = require("./scoped-credentials");
 const {
   getWorkspaceDefaultsByAgent,
   MAIN_AGENT_ID,
+  DOMAIN_COMMENTATOR_AGENT_ID,
+  COMMUNICATION_MANAGER_AGENT_ID,
   buildAgentWorkspaceDir,
 } = require("./workspace-files");
 const {
@@ -706,6 +708,15 @@ const HUMANOID_ROBOT_IDS = [
   "robot_6",
 ];
 
+function getManagedAgentIds({ humanoidEnabled = false } = {}) {
+  return [
+    MAIN_AGENT_ID,
+    DOMAIN_COMMENTATOR_AGENT_ID,
+    COMMUNICATION_MANAGER_AGENT_ID,
+    ...(humanoidEnabled ? HUMANOID_ROBOT_IDS : []),
+  ];
+}
+
 /**
  * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
  * Full tool profile with deny list for unsafe/irrelevant tools.
@@ -721,7 +732,11 @@ function writeOpenClawConfig() {
   const humanoidAuthMode = (process.env.HUMANOID_MCP_AUTH_MODE || "iam").trim().toLowerCase();
   const humanoidApiKeyHeader = (process.env.HUMANOID_MCP_API_KEY_HEADER || "x-api-key").trim();
   const humanoidEnabled = humanoidMcpUrl.length > 0;
+  const digitalHumanMcpUrl = humanoidMcpUrl;
+  const digitalHumanAuthMode = humanoidAuthMode;
+  const digitalHumanApiKeyHeader = humanoidApiKeyHeader;
   const mainWorkspaceDir = buildAgentWorkspaceDir(homeDir, MAIN_AGENT_ID);
+  const managedAgentIds = getManagedAgentIds({ humanoidEnabled });
   const mainAgent = {
     id: "main",
     name: "Main",
@@ -730,9 +745,57 @@ function writeOpenClawConfig() {
     workspace: mainWorkspaceDir,
   };
 
-  if (humanoidEnabled) {
-    mainAgent.subagents = { allowAgents: HUMANOID_ROBOT_IDS };
-  }
+  mainAgent.subagents = {
+    allowAgents: managedAgentIds.filter((agentId) => agentId !== MAIN_AGENT_ID),
+  };
+
+  const domainCommentatorAgent = {
+    id: DOMAIN_COMMENTATOR_AGENT_ID,
+    name: "Domain Arena Commentator",
+    model: "litellm/kimi-k2.5",
+    skills: ["digital_human"],
+    identity: { name: "Domain Arena Commentator" },
+    workspace: buildAgentWorkspaceDir(homeDir, DOMAIN_COMMENTATOR_AGENT_ID),
+    tools: {
+      profile: "full",
+      deny: [
+        "browser",
+        "web_search",
+        "web_fetch",
+        "subagents",
+      ],
+      elevated: {
+        enabled: true,
+        allowFrom: {
+          webchat: ["*"],
+          direct: ["*"],
+          gateway: ["*"],
+        },
+      },
+    },
+  };
+
+  const communicationManagerAgent = {
+    id: COMMUNICATION_MANAGER_AGENT_ID,
+    name: "communication-manager",
+    model: "litellm/kimi-k2.5",
+    skills: ["digital_human"],
+    identity: { name: "communication-manager" },
+    workspace: buildAgentWorkspaceDir(homeDir, COMMUNICATION_MANAGER_AGENT_ID),
+    tools: {
+      profile: "coding",
+      deny: ["subagents"],
+      elevated: {
+        enabled: true,
+        allowFrom: {
+          webchat: ["*"],
+          direct: ["*"],
+          gateway: ["*"],
+          telegram: ["*"],
+        },
+      },
+    },
+  };
 
   const robotAgents = humanoidEnabled
     ? HUMANOID_ROBOT_IDS.map((robotId, index) => ({
@@ -793,7 +856,7 @@ function writeOpenClawConfig() {
           mode: "off", // No Docker in AgentCore container; microVMs provide isolation
         },
       },
-      list: [mainAgent, ...robotAgents],
+      list: [mainAgent, domainCommentatorAgent, communicationManagerAgent, ...robotAgents],
     },
     tools: {
       profile: "full",
@@ -819,19 +882,30 @@ function writeOpenClawConfig() {
     skills: {
       allowBundled: [],
       load: { extraDirs: ["/skills"] },
-      entries: humanoidEnabled
-        ? {
-          humanoid: {
-            enabled: true,
-            env: {
-              MCP_SERVER_URL: humanoidMcpUrl,
-              MCP_AUTH_MODE: humanoidAuthMode,
-              MCP_API_KEY_HEADER: humanoidApiKeyHeader,
-              AWS_REGION: process.env.AWS_REGION || "us-east-1",
-            },
+      entries: {
+        digital_human: {
+          enabled: true,
+          env: {
+            MCP_SERVER_URL: digitalHumanMcpUrl,
+            MCP_AUTH_MODE: digitalHumanAuthMode,
+            MCP_API_KEY_HEADER: digitalHumanApiKeyHeader,
+            AWS_REGION: process.env.AWS_REGION || "us-east-1",
           },
-        }
-        : {},
+        },
+        ...(humanoidEnabled
+          ? {
+            humanoid: {
+              enabled: true,
+              env: {
+                MCP_SERVER_URL: humanoidMcpUrl,
+                MCP_AUTH_MODE: humanoidAuthMode,
+                MCP_API_KEY_HEADER: humanoidApiKeyHeader,
+                AWS_REGION: process.env.AWS_REGION || "us-east-1",
+              },
+            },
+          }
+          : {}),
+      },
     },
     gateway: {
       mode: "local",
@@ -856,7 +930,6 @@ function writeOpenClawConfig() {
     JSON.stringify(config, null, 2),
   );
   console.log("[contract] OpenClaw headless config written");
-  const managedAgentIds = [MAIN_AGENT_ID, ...robotAgents.map((agentDef) => agentDef.id)];
   const workspaceDefaultsByAgent = getWorkspaceDefaultsByAgent(
     {
       browserEnabled: Boolean(process.env.BROWSER_IDENTIFIER),
@@ -1253,9 +1326,9 @@ async function init(userId, actorId, channel) {
     try {
       await workspaceSync.syncManagedWorkspaceFiles(
         namespace,
-        (process.env.HUMANOID_MCP_SERVER_URL || "").trim()
-          ? [MAIN_AGENT_ID, ...HUMANOID_ROBOT_IDS]
-          : [MAIN_AGENT_ID],
+        getManagedAgentIds({
+          humanoidEnabled: Boolean((process.env.HUMANOID_MCP_SERVER_URL || "").trim()),
+        }),
       );
     } catch (err) {
       console.warn(`[contract] Managed workspace sync failed: ${err.message}`);

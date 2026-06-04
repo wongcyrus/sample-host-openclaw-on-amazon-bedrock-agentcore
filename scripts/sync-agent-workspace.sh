@@ -42,7 +42,7 @@ Options:
   --local-dir <path>   Local workspace directory
                        Default: ~/.openclaw-agent-workspaces/<namespace>
   --agents <csv>       Comma-separated agent list
-                       Default: main,robot_1,robot_2,robot_3,robot_4,robot_5,robot_6
+                       Default: main,domain-commentator,robot_1,robot_2,robot_3,robot_4,robot_5,robot_6
   --bucket <name>      Override S3 bucket name
   --region <region>    AWS region (default: from env or us-west-2)
   --force              Overwrite the local shared/agents/resolved trees on pull
@@ -169,11 +169,11 @@ if [ -n "${AWS_PROFILE:-}" ]; then
 fi
 
 if [ -z "$ACTOR_ID" ] && [ -z "$NAMESPACE" ] && [ -n "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
-    if [[ ! "${TELEGRAM_ADMIN_USER_ID}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: TELEGRAM_ADMIN_USER_ID must be numeric. Got: ${TELEGRAM_ADMIN_USER_ID}"
+    if ! validate_numeric_csv "${TELEGRAM_ADMIN_USER_ID}"; then
+        echo "ERROR: TELEGRAM_ADMIN_USER_ID must contain numeric IDs only (comma-separated is allowed). Got: ${TELEGRAM_ADMIN_USER_ID}"
         exit 1
     fi
-    ACTOR_ID="telegram:${TELEGRAM_ADMIN_USER_ID}"
+    ACTOR_ID="telegram:$(first_csv_value "${TELEGRAM_ADMIN_USER_ID}")"
 fi
 
 if [ -z "$NAMESPACE" ] && [ -n "$ACTOR_ID" ]; then
@@ -232,7 +232,13 @@ NODE
 default_agent_ids() {
     node - "$PROJECT_DIR" <<'NODE'
 const projectDir = process.argv[2];
-const { ROBOT_AGENT_IDS } = require(projectDir + "/bridge/workspace-files.js");
+const {
+  SPECIALIZED_AGENT_IDS,
+  ROBOT_AGENT_IDS,
+} = require(projectDir + "/bridge/workspace-files.js");
+for (const agentId of SPECIALIZED_AGENT_IDS) {
+  console.log(agentId);
+}
 for (const agentId of ROBOT_AGENT_IDS) {
   console.log(agentId);
 }

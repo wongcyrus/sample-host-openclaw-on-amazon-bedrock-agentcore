@@ -122,3 +122,24 @@ with_suffix() {
         printf '%s\n' "$base"
     fi
 }
+
+csv_lines() {
+    local raw="${1:-}"
+    printf '%s\n' "$raw" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF'
+}
+
+first_csv_value() {
+    csv_lines "${1:-}" | head -n 1
+}
+
+validate_numeric_csv() {
+    local raw="${1:-}"
+    local item=""
+    [ -n "$raw" ] || return 0
+
+    while IFS= read -r item; do
+        [[ "$item" =~ ^[0-9]+$ ]] || return 1
+    done < <(csv_lines "$raw")
+
+    return 0
+}
