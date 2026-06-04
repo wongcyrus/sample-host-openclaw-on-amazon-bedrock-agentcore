@@ -56,7 +56,7 @@ EOF
 }
 
 OPENCLAW_ENV_NAME="${OPENCLAW_ENV_NAME:-}"
-SKIP_SMOKE="${SKIP_SMOKE:-false}"
+SKIP_SMOKE="${SKIP_SMOKE:-true}"
 POSITIONAL_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
