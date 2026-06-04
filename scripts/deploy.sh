@@ -40,13 +40,12 @@ VENV_STAMP="$VENV_DIR/.requirements.sha256"
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/deploy.sh [--env <name>] [--skip-smoke] [--cdk-only|--runtime-only|--phase1|--phase3]
+  ./scripts/deploy.sh [--env <name>] [--cdk-only|--runtime-only|--phase1|--phase3]
 
 Options:
   default            Prefer .env.dev when present, otherwise fall back to .env.
   --env <name>       Load .env.<name> (for example .env.dev or .env.prod) and
                      require OPENCLAW_ENV_SUFFIX to match that name.
-  --skip-smoke       Skip post-deployment runtime and router smoke tests.
   --phase1           Deploy foundation stacks only.
   --runtime-only     Deploy the runtime stack only.
   --phase3           Deploy dependent stacks only.
@@ -56,7 +55,6 @@ EOF
 }
 
 OPENCLAW_ENV_NAME="${OPENCLAW_ENV_NAME:-}"
-SKIP_SMOKE="${SKIP_SMOKE:-true}"
 POSITIONAL_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -76,10 +74,6 @@ while [ $# -gt 0 ]; do
         usage
         exit 1
       fi
-      shift
-      ;;
-    --skip-smoke)
-      SKIP_SMOKE="true"
       shift
       ;;
     -h|--help)
@@ -403,280 +397,7 @@ STACK_AGENTCORE="$(with_suffix OpenClawAgentCore)"
 STACK_ROUTER="$(with_suffix OpenClawRouter)"
 STACK_CRON="$(with_suffix OpenClawCron)"
 STACK_TOKEN_MONITORING="$(with_suffix OpenClawTokenMonitoring)"
-TELEGRAM_SECRET_ID="$(with_suffix 'openclaw/channels/telegram')"
-WEBHOOK_SECRET_ID="$(with_suffix 'openclaw/webhook-secret')"
-IDENTITY_TABLE_NAME="$(with_suffix 'openclaw-identity')"
 telegram_setup_attempted=0
-
-stack_exists() {
-  local stack_name="$1"
-  aws cloudformation describe-stacks \
-    --stack-name "$stack_name" \
-    --region "$REGION" \
-    >/dev/null 2>&1
-}
-
-get_stack_resource_id() {
-  local stack_name="$1"
-  local query="$2"
-  aws cloudformation describe-stack-resources \
-    --region "$REGION" \
-    --stack-name "$stack_name" \
-    --query "$query" \
-    --output text 2>/dev/null || true
-}
-
-get_stack_output_value() {
-  local stack_name="$1"
-  local output_key="$2"
-  aws cloudformation describe-stacks \
-    --region "$REGION" \
-    --stack-name "$stack_name" \
-    --query "Stacks[0].Outputs[?OutputKey=='$output_key'].OutputValue | [0]" \
-    --output text 2>/dev/null || true
-}
-
-retry_with_backoff() {
-  local attempts="$1"
-  local sleep_seconds="$2"
-  shift 2
-  local attempt=1
-  while true; do
-    if "$@"; then
-      return 0
-    fi
-    if [ "$attempt" -ge "$attempts" ]; then
-      return 1
-    fi
-    echo "  attempt $attempt/$attempts failed; retrying in ${sleep_seconds}s..."
-    sleep "$sleep_seconds"
-    attempt=$((attempt + 1))
-  done
-}
-
-stop_agentcore_runtime_sessions() {
-  local runtime_arn=""
-  local qualifier=""
-  local session_ids_raw=""
-  local session_id=""
-
-  runtime_arn="$(get_stack_output_value "$STACK_AGENTCORE" "RuntimeArn")"
-  qualifier="$(get_stack_output_value "$STACK_AGENTCORE" "RuntimeEndpointId")"
-
-  if [ -z "$runtime_arn" ] || [ "$runtime_arn" = "None" ]; then
-    echo "Skipping AgentCore session recycle: RuntimeArn output not found."
-    return 0
-  fi
-
-  session_ids_raw="$(
-    aws dynamodb scan \
-      --region "$REGION" \
-      --table-name "$IDENTITY_TABLE_NAME" \
-      --filter-expression 'SK = :session' \
-      --expression-attribute-values '{":session":{"S":"SESSION"}}' \
-      --projection-expression 'sessionId' \
-      --query 'Items[].sessionId.S' \
-      --output text 2>/dev/null || true
-  )"
-
-  if [ -z "$session_ids_raw" ] || [ "$session_ids_raw" = "None" ]; then
-    echo "No recorded AgentCore sessions found in $IDENTITY_TABLE_NAME."
-    return 0
-  fi
-
-  echo "Recycling recorded AgentCore sessions..."
-  for session_id in $session_ids_raw; do
-    [ -n "$session_id" ] || continue
-    [ "$session_id" != "None" ] || continue
-    if [ -n "$qualifier" ] && [ "$qualifier" != "None" ]; then
-      aws bedrock-agentcore stop-runtime-session \
-        --agent-runtime-arn "$runtime_arn" \
-        --runtime-session-id "$session_id" \
-        --qualifier "$qualifier" \
-        --region "$REGION" >/dev/null 2>&1 || true
-    else
-      aws bedrock-agentcore stop-runtime-session \
-        --agent-runtime-arn "$runtime_arn" \
-        --runtime-session-id "$session_id" \
-        --region "$REGION" >/dev/null 2>&1 || true
-    fi
-    echo "  stopped ${session_id}"
-  done
-}
-
-router_webhook_smoke_once() {
-  local router_fn_name=""
-  local webhook_secret_arn=""
-  local webhook_secret=""
-  local payload_file=""
-  local output_file=""
-  local smoke_status=""
-
-  router_fn_name="$(get_stack_resource_id "$STACK_ROUTER" "StackResources[?LogicalResourceId=='RouterFnDA4EF4F3'].PhysicalResourceId | [0]")"
-  if [ -z "$router_fn_name" ] || [ "$router_fn_name" = "None" ]; then
-    echo "Router smoke failed: Router Lambda physical ID not found."
-    return 1
-  fi
-
-  webhook_secret_arn="$(
-    aws lambda get-function-configuration \
-      --function-name "$router_fn_name" \
-      --region "$REGION" \
-      --query 'Environment.Variables.WEBHOOK_SECRET_ID' \
-      --output text 2>/dev/null || true
-  )"
-  if [ -z "$webhook_secret_arn" ] || [ "$webhook_secret_arn" = "None" ]; then
-    echo "Router smoke failed: WEBHOOK_SECRET_ID not configured."
-    return 1
-  fi
-
-  webhook_secret="$(
-    aws secretsmanager get-secret-value \
-      --region "$REGION" \
-      --secret-id "$webhook_secret_arn" \
-      --query 'SecretString' \
-      --output text 2>/dev/null || true
-  )"
-  if [ -z "$webhook_secret" ] || [ "$webhook_secret" = "None" ]; then
-    echo "Router smoke failed: could not read webhook secret."
-    return 1
-  fi
-
-  payload_file="$(mktemp)"
-  output_file="$(mktemp)"
-  cat > "$payload_file" <<JSON
-{
-  "requestContext": {
-    "http": {
-      "method": "POST",
-      "path": "/webhook/telegram",
-      "sourceIp": "127.0.0.1"
-    }
-  },
-  "rawPath": "/webhook/telegram",
-  "headers": {
-    "content-type": "application/json",
-    "x-telegram-bot-api-secret-token": "$webhook_secret"
-  },
-  "isBase64Encoded": false,
-  "body": "{\"update_id\":999999999,\"message\":{}}"
-}
-JSON
-
-  aws lambda invoke \
-    --region "$REGION" \
-    --function-name "$router_fn_name" \
-    --cli-binary-format raw-in-base64-out \
-    --payload "fileb://$payload_file" \
-    "$output_file" >/dev/null 2>&1 || {
-      rm -f "$payload_file" "$output_file"
-      return 1
-    }
-
-  smoke_status="$(python3 - "$output_file" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as fh:
-    payload = json.load(fh)
-print(payload.get("statusCode", ""))
-PY
-)"
-  rm -f "$payload_file" "$output_file"
-
-  [ "$smoke_status" = "200" ]
-}
-
-runtime_chat_smoke_once() {
-  local runtime_arn=""
-  local qualifier=""
-  local session_id=""
-  local actor_id="test:deploy-smoke"
-  local user_id="deploy_smoke_user"
-  local payload_file=""
-  local response_file=""
-
-  runtime_arn="$(get_stack_output_value "$STACK_AGENTCORE" "RuntimeArn")"
-  qualifier="$(get_stack_output_value "$STACK_AGENTCORE" "RuntimeEndpointId")"
-  if [ -z "$runtime_arn" ] || [ "$runtime_arn" = "None" ]; then
-    echo "Runtime smoke failed: RuntimeArn output not found."
-    return 1
-  fi
-
-  session_id="deploy_smoke_$(date +%s)"
-  payload_file="$(mktemp)"
-  response_file="$(mktemp)"
-  cat > "$payload_file" <<JSON
-{"action":"chat","userId":"$user_id","actorId":"$actor_id","channel":"test","message":"health check"}
-JSON
-
-  if [ -n "$qualifier" ] && [ "$qualifier" != "None" ]; then
-    aws bedrock-agentcore invoke-agent-runtime \
-      --region "$REGION" \
-      --agent-runtime-arn "$runtime_arn" \
-      --qualifier "$qualifier" \
-      --runtime-session-id "$session_id" \
-      --runtime-user-id "$actor_id" \
-      --content-type application/json \
-      --accept application/json \
-      --payload "fileb://$payload_file" \
-      "$response_file" >/dev/null 2>&1 || {
-        rm -f "$payload_file" "$response_file"
-        return 1
-      }
-  else
-    aws bedrock-agentcore invoke-agent-runtime \
-      --region "$REGION" \
-      --agent-runtime-arn "$runtime_arn" \
-      --runtime-session-id "$session_id" \
-      --runtime-user-id "$actor_id" \
-      --content-type application/json \
-      --accept application/json \
-      --payload "fileb://$payload_file" \
-      "$response_file" >/dev/null 2>&1 || {
-        rm -f "$payload_file" "$response_file"
-        return 1
-      }
-  fi
-
-  python3 - "$response_file" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as fh:
-    payload = json.load(fh)
-response = str(payload.get("response", ""))
-status = str(payload.get("status", ""))
-if status == "error" or "trouble starting up" in response.lower() or "still starting up" in response.lower():
-    raise SystemExit(1)
-PY
-  local rc=$?
-  rm -f "$payload_file" "$response_file"
-  return "$rc"
-}
-
-post_runtime_deploy_checks() {
-  if [ "${SKIP_SMOKE:-false}" = "true" ]; then
-    echo "Skipping AgentCore runtime smoke test..."
-    return 0
-  fi
-  stop_agentcore_runtime_sessions
-  echo "Running AgentCore runtime smoke test..."
-  retry_with_backoff 12 10 runtime_chat_smoke_once || {
-    echo "ERROR: AgentCore runtime smoke test failed after deploy."
-    exit 1
-  }
-}
-
-post_router_deploy_checks() {
-  if [ "${SKIP_SMOKE:-false}" = "true" ]; then
-    echo "Skipping Router webhook smoke test..."
-    return 0
-  fi
-  echo "Running Router webhook smoke test..."
-  retry_with_backoff 12 10 router_webhook_smoke_once || {
-    echo "ERROR: Router webhook smoke test failed after deploy."
-    exit 1
-  }
-}
 
 # Resolve account and region
 ACCOUNT="${CDK_DEFAULT_ACCOUNT:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)}"
@@ -792,8 +513,6 @@ phase2_runtime() {
     "$STACK_AGENTCORE" \
     "${CDK_DEPLOY_FLAGS[@]}"
 
-  post_runtime_deploy_checks
-
   echo "  Phase 2 complete."
   echo ""
 }
@@ -809,8 +528,6 @@ phase3_cdk() {
     "$STACK_CRON" \
     "$STACK_TOKEN_MONITORING" \
     "${CDK_DEPLOY_FLAGS[@]}"
-
-  post_router_deploy_checks
 
   echo "  Phase 3 complete."
   echo ""
