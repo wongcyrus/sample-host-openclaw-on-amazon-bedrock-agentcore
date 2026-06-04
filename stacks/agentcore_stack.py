@@ -59,9 +59,24 @@ class AgentCoreStack(Stack):
         region = Stack.of(self).region
         cf_client = boto3.client("cloudformation", region_name=region)
         is_redeploy = False
+        has_managed_bucket = False
         try:
             cf_client.describe_stacks(StackName=self.stack_name)
             is_redeploy = True
+            try:
+                paginator = cf_client.get_paginator("list_stack_resources")
+                for page in paginator.paginate(StackName=self.stack_name):
+                    for res in page.get("StackResourceSummaries", []):
+                        if (
+                            res.get("LogicalResourceId", "").startswith("UserFilesBucket")
+                            and res.get("ResourceType") == "AWS::S3::Bucket"
+                        ):
+                            has_managed_bucket = True
+                            break
+                    if has_managed_bucket:
+                        break
+            except Exception:
+                has_managed_bucket = False
         except Exception:
             is_redeploy = False
         account = Stack.of(self).account
@@ -338,8 +353,8 @@ class AgentCoreStack(Stack):
             reuse_existing_bucket = True
         elif reuse_existing_bucket_normalized in {"0", "false", "no", "off"}:
             reuse_existing_bucket = False
-        elif is_redeploy:
-            # Standard redeployment must define the S3 bucket resource to avoid deletion
+        elif is_redeploy and has_managed_bucket:
+            # Standard redeployment must define the S3 bucket resource to avoid deletion ONLY if managed by the stack
             reuse_existing_bucket = False
         else:
             s3_client = boto3.client("s3", region_name=region)
