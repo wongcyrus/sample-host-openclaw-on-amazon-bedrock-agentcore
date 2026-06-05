@@ -752,7 +752,7 @@ function writeOpenClawConfig() {
   const domainCommentatorAgent = {
     id: DOMAIN_COMMENTATOR_AGENT_ID,
     name: "Domain Arena Commentator",
-    model: "litellm/kimi-k2.5",
+    model: PRIMARY_MODEL,
     skills: ["digital_human"],
     identity: { name: "Domain Arena Commentator" },
     workspace: buildAgentWorkspaceDir(homeDir, DOMAIN_COMMENTATOR_AGENT_ID),
@@ -778,7 +778,7 @@ function writeOpenClawConfig() {
   const communicationManagerAgent = {
     id: COMMUNICATION_MANAGER_AGENT_ID,
     name: "communication-manager",
-    model: "litellm/kimi-k2.5",
+    model: PRIMARY_MODEL,
     skills: ["digital_human"],
     identity: { name: "communication-manager" },
     workspace: buildAgentWorkspaceDir(homeDir, COMMUNICATION_MANAGER_AGENT_ID),
@@ -1646,13 +1646,13 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
-    const { message, onDelta, resolve, reject } = messageQueue.shift();
+    const { message, onDelta, agentId, actorId, channel, resolve, reject } = messageQueue.shift();
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
     );
 
     try {
-      const response = await bridgeMessage(message, 620000, onDelta);
+      const response = await bridgeMessage(message, 620000, onDelta, GATEWAY_PROTOCOL_VERSION, true, agentId, actorId, channel);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -1666,10 +1666,13 @@ async function processMessageQueue() {
  * Enqueue a message and wait for its response (serialized processing).
  * @param {string} message - The message to send
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
+ * @param {string} [agentId] - Optional agent ID to invoke directly
+ * @param {string} [actorId] - Optional actor ID
+ * @param {string} [channel] - Optional channel
  */
-function enqueueMessage(message, onDelta) {
+function enqueueMessage(message, onDelta, agentId, actorId, channel) {
   return new Promise((resolve, reject) => {
-    messageQueue.push({ message, onDelta, resolve, reject });
+    messageQueue.push({ message, onDelta, agentId, actorId, channel, resolve, reject });
     console.log(
       `[contract] Message enqueued (queue length: ${messageQueue.length})`,
     );
@@ -1686,6 +1689,9 @@ function enqueueMessage(message, onDelta) {
  * @param {function} [onDelta] - Optional callback invoked with cumulative text on each delta
  * @param {number} [protocolVersion] - Gateway protocol version to use for the connect handshake
  * @param {boolean} [allowProtocolFallback] - Retry once with the server-advertised expected protocol
+ * @param {string} [agentId] - Optional agent ID to invoke directly
+ * @param {string} [actorId] - Optional actor ID
+ * @param {string} [channel] - Optional channel
  */
 async function bridgeMessage(
   message,
@@ -1693,6 +1699,9 @@ async function bridgeMessage(
   onDelta,
   protocolVersion = GATEWAY_PROTOCOL_VERSION,
   allowProtocolFallback = true,
+  agentId = undefined,
+  actorId = undefined,
+  channel = undefined,
 ) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
@@ -1817,6 +1826,7 @@ async function bridgeMessage(
               onDelta,
               expectedProtocol,
               false,
+              agentId,
             ).then(resolve);
             return;
           }
@@ -1830,13 +1840,17 @@ async function bridgeMessage(
           "[contract] Authenticated successfully, sending chat.send...",
         );
         chatReqId = randomUUID();
+        const constructedSessionKey = agentId ? 
+          ((actorId && channel) ? `agent:${agentId}:${channel}:${actorId.replace(/:/g, "_")}` : "agent:" + agentId) : 
+          "global";
+        console.log(`[contract] WS sessionKey constructed: ${constructedSessionKey}`);
         ws.send(
           JSON.stringify({
             type: "req",
             id: chatReqId,
             method: "chat.send",
             params: {
-              sessionKey: "global",
+              sessionKey: constructedSessionKey,
               message: message,
               idempotencyKey: chatReqId,
             },
@@ -2158,7 +2172,7 @@ const server = http.createServer(async (req, res) => {
 
         // Cron action — blocks until init completes, then bridges the message
         if (action === "cron") {
-          const { userId, actorId, channel, message } = payload;
+          const { userId, actorId, channel, message, agentId } = payload;
           if (!userId || !actorId || !message) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(
@@ -2210,7 +2224,7 @@ const server = http.createServer(async (req, res) => {
           try {
             // Enqueue message (serialized with chat messages to prevent WebSocket races)
             try {
-              responseText = await enqueueMessage(message);
+              responseText = await enqueueMessage(message, undefined, agentId, actorId, channel);
             } catch (bridgeErr) {
               responseText = "";
               console.error(
@@ -2260,13 +2274,69 @@ const server = http.createServer(async (req, res) => {
 
         // Chat action — lazy init and bridge
         if (action === "chat") {
-          const { userId, actorId, channel, message } = payload;
+          let { userId, actorId, channel, message, agentId } = payload;
           if (!userId || !actorId || !message) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({ error: "Missing userId, actorId, or message" }),
             );
             return;
+          }
+
+          // Support base64 encoded images (e.g. from serverless JJK commentary backend)
+          const imagesUploaded = [];
+          const s3Bucket = process.env.S3_USER_FILES_BUCKET;
+
+          if (s3Bucket && (payload.image || payload.image_p2)) {
+            try {
+              const { PutObjectCommand } = require("@aws-sdk/client-s3");
+              const s3 = workspaceSync.getS3Client();
+
+              const uploadBase64 = async (b64Data, format, suffixName) => {
+                try {
+                  const buffer = Buffer.from(b64Data, "base64");
+                  const contentType = format === "png" ? "image/png" : 
+                                      format === "gif" ? "image/gif" :
+                                      format === "webp" ? "image/webp" : "image/jpeg";
+                  const cleanFormat = format === "png" ? "png" : 
+                                      format === "gif" ? "gif" :
+                                      format === "webp" ? "webp" : "jpeg";
+                  // S3 key in user's namespace: userId + "/_uploads/"
+                  const s3Key = `${userId}/_uploads/game_${Date.now()}_${suffixName}.${cleanFormat}`;
+                  
+                  await s3.send(new PutObjectCommand({
+                    Bucket: s3Bucket,
+                    Key: s3Key,
+                    Body: buffer,
+                    ContentType: contentType
+                  }));
+
+                  console.log(`[contract] Successfully uploaded base64 image to S3: ${s3Key}`);
+                  return { s3Key, contentType };
+                } catch (err) {
+                  console.error(`[contract] Base64 image upload failed: ${err.message}`);
+                  return null;
+                }
+              };
+
+              if (payload.image) {
+                const uploaded = await uploadBase64(payload.image, payload.image_format || "jpeg", "p1");
+                if (uploaded) imagesUploaded.push(uploaded);
+              }
+              if (payload.image_p2) {
+                const uploaded = await uploadBase64(payload.image_p2, payload.image_format_p2 || "jpeg", "p2");
+                if (uploaded) imagesUploaded.push(uploaded);
+              }
+            } catch (err) {
+              console.error(`[contract] Failed to process payload images: ${err.message}`);
+            }
+          }
+
+          if (imagesUploaded.length > 0) {
+            message = {
+              text: message,
+              images: imagesUploaded
+            };
           }
 
           // Update shared identity file so proxy picks up cross-channel changes
@@ -2344,7 +2414,7 @@ const server = http.createServer(async (req, res) => {
             if (openclawReady) {
               // Full OpenClaw path — WebSocket bridge
               try {
-                responseText = await enqueueMessage(bridgeText, onDelta);
+                responseText = await enqueueMessage(bridgeText, onDelta, agentId, actorId, channel);
               } catch (bridgeErr) {
                 console.error(
                   `[contract] Bridge error, falling back to shim: ${bridgeErr.message}`,
@@ -2659,16 +2729,25 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
-  );
-  console.log(
-    "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron|dashboard_snapshot|dashboard_events}, WS /ws",
-  );
+if (process.env.NODE_ENV !== "test") {
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(
+      `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,
+    );
+    console.log(
+      "[contract] Endpoints: GET /ping, POST /invocations {action: chat|status|warmup|cron|dashboard_snapshot|dashboard_events}, WS /ws",
+    );
 
-  // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)
-  secretsPrefetchPromise = prefetchSecrets().catch((err) => {
-    console.warn(`[contract] Secret prefetch failed: ${err.message}`);
+    // Pre-fetch secrets in background (saves ~2-3s from first-message critical path)
+    secretsPrefetchPromise = prefetchSecrets().catch((err) => {
+      console.warn(`[contract] Secret prefetch failed: ${err.message}`);
+    });
   });
-});
+} else {
+  module.exports = {
+    enqueueMessage,
+    bridgeMessage,
+    processMessageQueue,
+    buildBridgeText,
+  };
+}
