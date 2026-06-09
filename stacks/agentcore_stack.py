@@ -553,6 +553,7 @@ class AgentCoreStack(Stack):
         runtime_env = {
             "AWS_REGION": region,
             "BEDROCK_MODEL_ID": default_model_id,
+            "OPENCLAW_ENVIRONMENT": suffix or "prod",
             "GATEWAY_TOKEN_SECRET_ID": gateway_token_secret_arn,
             "COGNITO_USER_POOL_ID": cognito_user_pool_id,
             "COGNITO_CLIENT_ID": cognito_client_id,

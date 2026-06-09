@@ -4,6 +4,8 @@ import os
 import re
 from dataclasses import dataclass
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from aws_cdk import RemovalPolicy, aws_logs as logs
 
 # Map integer days to the nearest valid RetentionDays enum member.
@@ -94,6 +96,96 @@ def retain_stateful_resources(scope) -> bool:
     if parsed is None:
         return True
     return parsed
+
+
+def manage_bedrock_invocation_logging(scope) -> bool:
+    """Whether this deployment should own shared Bedrock invocation logging.
+
+    Bedrock invocation logging is shared per account+region, so only one
+    deployment should manage it. Default behavior:
+    - prod / unsuffixed deployment: enabled
+    - suffixed deployments: enabled only when they are the only OpenClaw
+      deployment in the account+region (for example, a dev-only setup)
+
+    This can still be overridden explicitly via env var or CDK context.
+    """
+    raw_value = os.environ.get("MANAGE_BEDROCK_INVOCATION_LOGGING")
+    if raw_value is None:
+        raw_value = scope.node.try_get_context("manage_bedrock_invocation_logging")
+
+    parsed = parse_optional_bool(raw_value)
+    if raw_value is not None and str(raw_value).strip() and parsed is None:
+        raise ValueError(
+            "manage_bedrock_invocation_logging/MANAGE_BEDROCK_INVOCATION_LOGGING "
+            "must be one of: true, false, 1, 0, yes, no, on, off"
+        )
+    if parsed is not None:
+        return parsed
+
+    suffix = environment_suffix(scope)
+    if suffix in {"", "prod"}:
+        return True
+
+    region = getattr(getattr(scope, "region", None), "strip", lambda: "")()
+    if not region:
+        region = os.environ.get("CDK_DEFAULT_REGION", "").strip()
+    if not region:
+        return False
+
+    try:
+        cf = boto3.client("cloudformation", region_name=region)
+        paginator = cf.get_paginator("list_stacks")
+        stack_names = set()
+        for page in paginator.paginate(
+            StackStatusFilter=[
+                "CREATE_IN_PROGRESS",
+                "CREATE_COMPLETE",
+                "ROLLBACK_IN_PROGRESS",
+                "ROLLBACK_FAILED",
+                "ROLLBACK_COMPLETE",
+                "DELETE_IN_PROGRESS",
+                "DELETE_FAILED",
+                "UPDATE_IN_PROGRESS",
+                "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS",
+                "UPDATE_COMPLETE",
+                "UPDATE_FAILED",
+                "UPDATE_ROLLBACK_IN_PROGRESS",
+                "UPDATE_ROLLBACK_FAILED",
+                "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS",
+                "UPDATE_ROLLBACK_COMPLETE",
+                "REVIEW_IN_PROGRESS",
+                "IMPORT_IN_PROGRESS",
+                "IMPORT_COMPLETE",
+                "IMPORT_ROLLBACK_IN_PROGRESS",
+                "IMPORT_ROLLBACK_FAILED",
+                "IMPORT_ROLLBACK_COMPLETE",
+            ]
+        ):
+            for summary in page.get("StackSummaries", []):
+                name = summary.get("StackName", "")
+                if name.startswith(("OpenClawObservability", "OpenClawTokenMonitoring")):
+                    stack_names.add(name)
+    except (BotoCoreError, ClientError):
+        return False
+
+    preferred_owner_present = any(
+        name in {
+            "OpenClawObservability",
+            "OpenClawObservability-prod",
+            "OpenClawTokenMonitoring",
+            "OpenClawTokenMonitoring-prod",
+        }
+        for name in stack_names
+    )
+    if preferred_owner_present:
+        return False
+
+    current_env_stack_names = {
+        f"OpenClawObservability-{suffix}",
+        f"OpenClawTokenMonitoring-{suffix}",
+    }
+    other_env_stack_names = stack_names - current_env_stack_names
+    return not other_env_stack_names
 
 
 def stateful_removal_policy(scope) -> RemovalPolicy:

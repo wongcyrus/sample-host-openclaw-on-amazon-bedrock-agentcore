@@ -22,7 +22,11 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer, stateful_removal_policy
+from stacks import (
+    DeploymentNamer,
+    manage_bedrock_invocation_logging,
+    stateful_removal_policy,
+)
 
 
 class TokenMonitoringStack(Stack):
@@ -39,23 +43,14 @@ class TokenMonitoringStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         namer = DeploymentNamer.from_scope(self)
+        deployment_environment = namer.suffix or "prod"
         region = Stack.of(self).region
         account = Stack.of(self).account
         daily_token_budget = self.node.try_get_context("daily_token_budget") or 1_000_000
         daily_cost_budget = self.node.try_get_context("daily_cost_budget_usd") or 5
         anomaly_band = self.node.try_get_context("anomaly_band_width") or 2
         ttl_days = self.node.try_get_context("token_ttl_days") or 90
-        manage_bedrock_logging_raw = (
-            self.node.try_get_context("manage_bedrock_invocation_logging")
-            or os.environ.get("MANAGE_BEDROCK_INVOCATION_LOGGING")
-            or ""
-        )
-        manage_bedrock_logging = str(manage_bedrock_logging_raw).lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        manage_bedrock_logging = manage_bedrock_invocation_logging(self)
 
         # --- DynamoDB Token Usage Table -----------------------------------
         token_table_name = namer.name("openclaw-token-usage")
@@ -215,33 +210,39 @@ class TokenMonitoringStack(Stack):
 
         # --- Custom Metrics -----------------------------------------------
         ns = "OpenClaw/TokenUsage"
+        env_dimensions = {"Environment": deployment_environment}
         total_tokens = cw.Metric(
             namespace=ns,
             metric_name="TotalTokens",
+            dimensions_map=env_dimensions,
             period=Duration.hours(1),
             statistic="Sum",
         )
         input_tokens = cw.Metric(
             namespace=ns,
             metric_name="InputTokens",
+            dimensions_map=env_dimensions,
             period=Duration.hours(1),
             statistic="Sum",
         )
         output_tokens = cw.Metric(
             namespace=ns,
             metric_name="OutputTokens",
+            dimensions_map=env_dimensions,
             period=Duration.hours(1),
             statistic="Sum",
         )
         estimated_cost = cw.Metric(
             namespace=ns,
             metric_name="EstimatedCostUSD",
+            dimensions_map=env_dimensions,
             period=Duration.hours(1),
             statistic="Sum",
         )
         invocation_count = cw.Metric(
             namespace=ns,
             metric_name="InvocationCount",
+            dimensions_map=env_dimensions,
             period=Duration.hours(1),
             statistic="Sum",
         )
@@ -256,6 +257,11 @@ class TokenMonitoringStack(Stack):
         dashboard.add_widgets(
             cw.TextWidget(
                 markdown="# OpenClaw Token Analytics Dashboard",
+                width=24,
+                height=1,
+            ),
+            cw.TextWidget(
+                markdown=f"Environment filter: `{deployment_environment}`",
                 width=24,
                 height=1,
             ),
@@ -316,6 +322,12 @@ class TokenMonitoringStack(Stack):
             metric_name="TotalTokens",
             namespace=ns,
             stat="Sum",
+            dimensions=[
+                cw.CfnAnomalyDetector.DimensionProperty(
+                    name="Environment",
+                    value=deployment_environment,
+                )
+            ],
         )
 
         CfnOutput(

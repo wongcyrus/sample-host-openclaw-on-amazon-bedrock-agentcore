@@ -22,9 +22,16 @@ if (!AWS_REGION) {
 }
 const MODEL_ID =
   process.env.BEDROCK_MODEL_ID || "minimax.minimax-m2.1";
+const OPENCLAW_ENVIRONMENT =
+  (process.env.OPENCLAW_ENVIRONMENT || process.env.OPENCLAW_ENV_SUFFIX || "prod")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "") || "prod";
 
 // Log credential env vars at startup for debugging
-console.log(`[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID}`);
+console.log(
+  `[proxy] AWS_REGION=${AWS_REGION} MODEL_ID=${MODEL_ID} ENV=${OPENCLAW_ENVIRONMENT}`,
+);
 console.log(`[proxy] Credential env: RELATIVE_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI} FULL_URI=${!!process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI} AUTH_TOKEN=${!!process.env.AWS_CONTAINER_AUTHORIZATION_TOKEN}`);
 
 // Subagent model routing — distinct model name lets proxy detect subagent requests
@@ -1009,11 +1016,34 @@ function resolveModelId(requestedModel) {
   return MODEL_ID;
 }
 
+function sanitizeRequestMetadataValue(value, fallback = "unknown") {
+  const normalized = String(value || "")
+    .trim()
+    .slice(0, 256)
+    .replace(/[^a-zA-Z0-9\s:_@$#=/+,\-.]/g, "");
+  return normalized || fallback;
+}
+
+function buildRequestMetadata({ actorId, channel, sessionId }) {
+  return {
+    "openclaw.actor_id": sanitizeRequestMetadataValue(actorId, "default-user"),
+    "openclaw.channel": sanitizeRequestMetadataValue(channel, "unknown"),
+    "openclaw.session_id": sanitizeRequestMetadataValue(sessionId, "default-session"),
+    "openclaw.environment": sanitizeRequestMetadataValue(OPENCLAW_ENVIRONMENT, "prod"),
+  };
+}
+
 /**
  * Call Bedrock Converse API (non-streaming).
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
-async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel) {
+async function invokeBedrock(
+  messages,
+  systemTextOverride,
+  toolConfig,
+  requestedModel,
+  requestMetadata,
+) {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
@@ -1031,6 +1061,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
+    requestMetadata,
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
@@ -1112,6 +1143,7 @@ async function invokeBedrockStreaming(
   model,
   systemTextOverride,
   toolConfig,
+  requestMetadata,
 ) {
   const {
     BedrockRuntimeClient,
@@ -1130,6 +1162,7 @@ async function invokeBedrockStreaming(
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 16384, temperature: 0.7 },
+    requestMetadata,
     ...(guardrailConfig && { guardrailConfig }),
   };
   if (toolConfig) params.toolConfig = toolConfig;
@@ -1407,6 +1440,11 @@ const server = http.createServer(async (req, res) => {
         // Extract identity for all modes (used for logging + Cognito)
         const { sessionId, actorId, channel, idSource } =
           extractSessionMetadata(parsed, req.headers);
+        const requestMetadata = buildRequestMetadata({
+          actorId,
+          channel,
+          sessionId,
+        });
         chatRequestCount++;
 
         // Detect and count subagent requests
@@ -1541,6 +1579,7 @@ const server = http.createServer(async (req, res) => {
             parsed.model,
             systemTextOverride,
             toolConfig,
+            requestMetadata,
           );
         } else {
           const result = await invokeBedrock(
@@ -1548,6 +1587,7 @@ const server = http.createServer(async (req, res) => {
             systemTextOverride,
             toolConfig,
             parsed.model,
+            requestMetadata,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(

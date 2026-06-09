@@ -45,6 +45,8 @@ MODEL_PRICING = {
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3.00, "output": 15.00},
     "anthropic.claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "anthropic.claude-opus-4-6": {"input": 15.00, "output": 75.00},
+    # Moonshot AI Kimi
+    "moonshotai.kimi-k2.5": {"input": 0.60, "output": 3.00},
     "minimax.minimax-m2": {"input": 1.00, "output": 5.00},
 }
 
@@ -66,7 +68,7 @@ def estimate_cost(model_id: str, input_tokens: int, output_tokens: int) -> float
 
 
 def extract_openclaw_metadata(log_entry: dict) -> dict:
-    """Extract OpenClaw metadata (actor_id, session_id, channel) from the log entry.
+    """Extract OpenClaw metadata from the log entry.
 
     Bedrock invocation logs may contain request metadata or we can correlate
     via X-Ray trace IDs. Supports both direct Bedrock and AgentCore log formats.
@@ -75,6 +77,7 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
         "actor_id": "default-user",
         "session_id": "default-session",
         "channel": "unknown",
+        "environment": "prod",
     }
 
     # Try to extract from request metadata or headers
@@ -83,6 +86,9 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
         metadata["actor_id"] = request_metadata.get("openclaw.actor_id", metadata["actor_id"])
         metadata["session_id"] = request_metadata.get("openclaw.session_id", metadata["session_id"])
         metadata["channel"] = request_metadata.get("openclaw.channel", metadata["channel"])
+        metadata["environment"] = request_metadata.get(
+            "openclaw.environment", metadata["environment"]
+        )
 
     # AgentCore logs: extract from sessionState.promptSessionAttributes
     session_state = log_entry.get("sessionState", {})
@@ -90,6 +96,7 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
     if prompt_attrs:
         metadata["actor_id"] = prompt_attrs.get("actor_id", metadata["actor_id"])
         metadata["channel"] = prompt_attrs.get("channel", metadata["channel"])
+        metadata["environment"] = prompt_attrs.get("environment", metadata["environment"])
 
     # AgentCore logs: extract session ID from top-level field
     if log_entry.get("sessionId"):
@@ -115,6 +122,7 @@ def extract_openclaw_metadata(log_entry: dict) -> dict:
         metadata["actor_id"] = custom_attrs.get("actor_id", metadata["actor_id"])
         metadata["session_id"] = custom_attrs.get("session_id", metadata["session_id"])
         metadata["channel"] = custom_attrs.get("channel", metadata["channel"])
+        metadata["environment"] = custom_attrs.get("environment", metadata["environment"])
 
     return metadata
 
@@ -124,6 +132,7 @@ def write_to_dynamodb(record: dict):
     actor_id = record["actor_id"]
     session_id = record["session_id"]
     channel = record["channel"]
+    environment = record["environment"]
     model_id = record["model_id"]
     date_str = record["date"]
     cost = record["estimated_cost_usd"]
@@ -136,15 +145,15 @@ def write_to_dynamodb(record: dict):
 
     item = {
         "PK": f"USER#{actor_id}",
-        "SK": f"DATE#{date_str}#CHANNEL#{channel}#SESSION#{session_id}",
+        "SK": f"ENV#{environment}#DATE#{date_str}#CHANNEL#{channel}#SESSION#{session_id}",
         # GSI1: Channel aggregation
-        "GSI1PK": f"CHANNEL#{channel}",
+        "GSI1PK": f"ENV#{environment}#CHANNEL#{channel}",
         "GSI1SK": f"DATE#{date_str}",
         # GSI2: Model aggregation
-        "GSI2PK": f"MODEL#{model_id}",
+        "GSI2PK": f"ENV#{environment}#MODEL#{model_id}",
         "GSI2SK": f"DATE#{date_str}",
         # GSI3: Daily cost ranking
-        "GSI3PK": f"DATE#{date_str}",
+        "GSI3PK": f"ENV#{environment}#DATE#{date_str}",
         "GSI3SK": f"COST#{cost_sort}",
         # Attributes
         "inputTokens": record["input_tokens"],
@@ -156,6 +165,7 @@ def write_to_dynamodb(record: dict):
         "modelId": model_id,
         "actorId": actor_id,
         "sessionId": session_id,
+        "environment": environment,
         "timestamp": record["timestamp"],
         "ttl": ttl,
     }
@@ -167,7 +177,7 @@ def write_to_dynamodb(record: dict):
             "SET GSI1PK = :g1pk, GSI1SK = :g1sk, "
             "GSI2PK = :g2pk, GSI2SK = :g2sk, "
             "GSI3PK = :g3pk, GSI3SK = :g3sk, "
-            "channel = :channel, modelId = :model, "
+            "channel = :channel, modelId = :model, environment = :environment, "
             "actorId = :actor, sessionId = :session, "
             "#ts = :ts, #ttl_attr = :ttl "
             "ADD inputTokens :inp, outputTokens :out, "
@@ -186,6 +196,7 @@ def write_to_dynamodb(record: dict):
             ":g3sk": item["GSI3SK"],
             ":channel": channel,
             ":model": model_id,
+            ":environment": environment,
             ":actor": actor_id,
             ":session": session_id,
             ":ts": record["timestamp"],
@@ -201,16 +212,18 @@ def write_to_dynamodb(record: dict):
 def publish_metrics(record: dict):
     """Publish CloudWatch custom metrics with dimensions."""
     dimensions_base = [
+        {"Name": "Environment", "Value": record["environment"]},
         {"Name": "ActorId", "Value": record["actor_id"]},
         {"Name": "Channel", "Value": record["channel"]},
         {"Name": "ModelId", "Value": record["model_id"]},
     ]
+    environment_dimensions = [{"Name": "Environment", "Value": record["environment"]}]
 
-    # Also publish without dimensions for aggregate view
+    # Publish env-filtered metrics plus fully aggregated metrics.
     metric_data = []
     timestamp = datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00"))
 
-    for dims in [dimensions_base, []]:
+    for dims in [dimensions_base, environment_dimensions, []]:
         metric_data.extend(
             [
                 {
@@ -264,11 +277,22 @@ def process_log_entry(log_entry: dict):
     input_tokens = log_entry.get("inputTokenCount", 0)
     output_tokens = log_entry.get("outputTokenCount", 0)
 
+    # Bedrock invocation logs typically nest token counts under input/output objects.
+    if not input_tokens:
+        input_tokens = log_entry.get("input", {}).get("inputTokenCount", 0)
+    if not output_tokens:
+        output_tokens = log_entry.get("output", {}).get("outputTokenCount", 0)
+
     # Some log formats nest token counts differently
     if not input_tokens and not output_tokens:
         usage = log_entry.get("usage", {})
         input_tokens = usage.get("inputTokens", usage.get("input_tokens", 0))
         output_tokens = usage.get("outputTokens", usage.get("output_tokens", 0))
+    if not input_tokens and not output_tokens:
+        output_body = log_entry.get("output", {}).get("outputBodyJson", {})
+        output_usage = output_body.get("usage", {})
+        input_tokens = output_usage.get("inputTokens", output_usage.get("input_tokens", 0))
+        output_tokens = output_usage.get("outputTokens", output_usage.get("output_tokens", 0))
 
     total_tokens = input_tokens + output_tokens
 
@@ -295,6 +319,7 @@ def process_log_entry(log_entry: dict):
         "actor_id": metadata["actor_id"],
         "session_id": metadata["session_id"],
         "channel": metadata["channel"],
+        "environment": metadata["environment"],
         "model_id": model_id,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -305,7 +330,8 @@ def process_log_entry(log_entry: dict):
     }
 
     logger.info(
-        "Processing invocation: model=%s input=%d output=%d cost=$%.6f actor=%s channel=%s",
+        "Processing invocation: env=%s model=%s input=%d output=%d cost=$%.6f actor=%s channel=%s",
+        metadata["environment"],
         model_id,
         input_tokens,
         output_tokens,

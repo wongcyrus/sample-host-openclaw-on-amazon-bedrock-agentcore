@@ -602,7 +602,7 @@ All tunable parameters are in `cdk.json`:
 | `environment_suffix` | `""` | Environment suffix appended to stack names and fixed physical names so multiple deployments can coexist in one account/region. Set it in `.env` or `OPENCLAW_ENV_SUFFIX` when you want suffixed environments like `dev` or `prod` |
 | `retain_stateful_resources` | `true` | Controls whether stateful resources use `RemovalPolicy.RETAIN` or `RemovalPolicy.DESTROY`. You can set it in `cdk.json`, but `.env` `RETAIN_STATEFUL_RESOURCES=true|false` is also honored by `deploy.sh` |
 | `reuse_existing_user_files_bucket` | `false` | Reuse an existing user-files S3 bucket instead of creating it. If left unset, the AgentCore stack now uses boto3 `head_bucket()` during synth to auto-import a retained bucket with the expected name when it already exists |
-| `manage_bedrock_invocation_logging` | `false` | Whether this environment owns the shared Bedrock model invocation logging configuration and CloudWatch Logs subscription. Set this to `true` in exactly one environment per AWS account+region |
+| `manage_bedrock_invocation_logging` | auto (`true` for unsuffixed/prod, or for a lone suffixed deployment such as `dev`; otherwise `false`) | Whether this environment owns the shared Bedrock model invocation logging configuration and CloudWatch Logs subscription. Override it only when you need a non-default owner. All environments still get their own token dashboards by filtering the shared `OpenClaw/TokenUsage` metrics on the `Environment` dimension |
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` env var |
 | `region` | `""` | AWS region. Falls back to `CDK_DEFAULT_REGION` env var |
 | `availability_zones` | `["us-east-1b", "us-east-1c"]` | Optional list of AZ names to use for VPC. Set this only if AgentCore Runtime has AZ restrictions in your region. See deployment notes above |
@@ -650,7 +650,7 @@ Named resources that are intentionally long-lived are auto-reused during synth w
 - Security Secrets Manager secrets
 - Security Cognito user pool and proxy app client
 
-Retained resources are expected to be reused, not silently replaced with newly generated names. Shared account-level resources still keep their separate guards: for example, Bedrock invocation logging stays behind `manage_bedrock_invocation_logging` because that log group is account+region shared rather than environment-owned.
+Retained resources are expected to be reused, not silently replaced with newly generated names. Shared account-level resources still keep their separate guards: for example, Bedrock invocation logging stays behind `manage_bedrock_invocation_logging` because that log group is account+region shared rather than environment-owned. The shared token metrics pipeline tags every Bedrock invocation with an `Environment` value, so `OpenClaw-Token-Analytics-dev` and `OpenClaw-Token-Analytics`/prod can coexist without double-counting. If `dev` is the only deployed OpenClaw environment in an account+region, it now auto-owns the shared Bedrock logging pipeline until a prod/unsuffixed deployment exists.
 
 If you set `RETAIN_STATEFUL_RESOURCES=false`, the stacks switch those stateful resources to `RemovalPolicy.DESTROY` instead. Stack-managed S3 buckets also enable automatic object cleanup so CloudFormation can delete them even when they still contain files or object versions.
 

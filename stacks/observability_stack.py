@@ -17,7 +17,7 @@ from aws_cdk import (
 import cdk_nag
 from constructs import Construct
 
-from stacks import DeploymentNamer, retention_days
+from stacks import DeploymentNamer, manage_bedrock_invocation_logging, retention_days
 
 
 class ObservabilityStack(Stack):
@@ -36,17 +36,7 @@ class ObservabilityStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         topic_name = namer.name("openclaw-alarms")
         router_function_name = namer.name("openclaw-router")
-        manage_bedrock_logging_raw = (
-            self.node.try_get_context("manage_bedrock_invocation_logging")
-            or os.environ.get("MANAGE_BEDROCK_INVOCATION_LOGGING")
-            or ""
-        )
-        manage_bedrock_logging = str(manage_bedrock_logging_raw).lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        manage_bedrock_logging = manage_bedrock_invocation_logging(self)
         invocation_log_group_name = "/aws/bedrock/invocation-logs"
         bedrock_logging_resource_id = namer.name("bedrock-invocation-logging")
         self.logging_cr: cr.AwsCustomResource | None = None

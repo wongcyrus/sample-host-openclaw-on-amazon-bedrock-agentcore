@@ -1275,6 +1275,8 @@ async function init(userId, actorId, channel) {
         S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
         SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
         SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
+        OPENCLAW_ENVIRONMENT:
+          process.env.OPENCLAW_ENVIRONMENT || process.env.OPENCLAW_ENV_SUFFIX || "prod",
         USER_ID: actorId,
         INTERNAL_USER_ID: userId,  // container internal userId for skill authorization
         CHANNEL: channel,
@@ -1985,17 +1987,15 @@ function buildBridgeText(message) {
     message !== null &&
     Array.isArray(message.images)
   ) {
+    const txt = extractTextFromContent(message.text);
     return (
-      (message.text || "") +
+      txt +
       "\n\n[OPENCLAW_IMAGES:" +
       JSON.stringify(message.images) +
       "]"
     );
   }
-  if (typeof message === "string") {
-    return message;
-  }
-  return String(message);
+  return extractTextFromContent(message);
 }
 
 /**
