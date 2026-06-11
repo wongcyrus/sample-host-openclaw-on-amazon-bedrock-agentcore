@@ -158,21 +158,20 @@ describe("buildSessionPolicy", () => {
     assert.equal(passRoleStmt.Resource, "*", "PassRole resource should be wildcard");
   });
 
-  it("includes lambda invoke permissions for function URLs in statement 1", () => {
+  it("includes bedrock-agentcore gateway invoke permissions in statement 1", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
     });
 
     const parsed = JSON.parse(policy);
-    const lambdaStmt = parsed.Statement.find(
+    const gatewayStmt = parsed.Statement.find(
       (s) =>
         Array.isArray(s.Action) &&
-        s.Action.includes("lambda:InvokeFunction") &&
-        s.Action.includes("lambda:InvokeFunctionUrl"),
+        s.Action.includes("bedrock-agentcore:InvokeGateway"),
     );
-    assert.ok(lambdaStmt, "should have Lambda function URL invoke actions");
-    assert.equal(lambdaStmt.Resource, "*", "Lambda resource should be wildcard in session policy");
+    assert.ok(gatewayStmt, "should have Bedrock AgentCore gateway invoke action");
+    assert.equal(gatewayStmt.Resource, "*", "Gateway resource should be wildcard in session policy");
   });
 
   it("includes iam:PassRole even when eventbridgeRoleArn not provided", () => {

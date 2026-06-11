@@ -227,21 +227,16 @@ class AgentCoreStack(Stack):
             self.node.try_get_context("humanoid_mcp_function_arn") or ""
         ).strip()
         if humanoid_auth_mode == "iam" and humanoid_function_arn:
+            # Grant permission to invoke the Bedrock AgentCore Gateway.
+            # If humanoid_function_arn is still configured as a legacy Lambda function ARN,
+            # we also automatically add the correct gateway ARN wildcard pattern to prevent permission errors.
+            resources = [humanoid_function_arn]
+            if "arn:aws:bedrock-agentcore" not in humanoid_function_arn:
+                resources.append(f"arn:aws:bedrock-agentcore:{region}:{account}:gateway/*")
             self.execution_role.add_to_policy(
                 iam.PolicyStatement(
-                    actions=["lambda:InvokeFunctionUrl"],
-                    resources=[humanoid_function_arn],
-                    conditions={
-                        "StringEquals": {
-                            "lambda:FunctionUrlAuthType": "AWS_IAM",
-                        }
-                    },
-                )
-            )
-            self.execution_role.add_to_policy(
-                iam.PolicyStatement(
-                    actions=["lambda:InvokeFunction"],
-                    resources=[humanoid_function_arn],
+                    actions=["bedrock-agentcore:InvokeGateway"],
+                    resources=resources,
                 )
             )
 
@@ -602,6 +597,18 @@ class AgentCoreStack(Stack):
             platform=ecr_assets.Platform.LINUX_ARM64,
             display_name=namer.name("openclaw-agentcore-runtime"),
             extra_hash=image_version,
+            exclude=[
+                "cdk.out",
+                "cdk.out.temp",
+                ".venv",
+                ".venv-review",
+                "venv",
+                "ENV",
+                ".git",
+                "node_modules",
+                ".pytest_cache",
+                "__pycache__",
+            ],
         )
 
         runtime_network_config = agentcore.RuntimeNetworkConfiguration.using_public_network()
@@ -701,6 +708,7 @@ class AgentCoreStack(Stack):
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*",
                         f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:workload-identity-directory/default/workload-identity/*",
+                        f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:gateway/*",
                         *[f"Resource::{secret_arn}" for secret_arn in secret_resource_arns],
                         "Resource::*",
                         f"Resource::arn:aws:logs:{region}:{account}:log-group:/openclaw/*",

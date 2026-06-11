@@ -314,13 +314,13 @@ OPENCLAW_ENV_SUFFIX=dev
 CDK_DEFAULT_REGION=us-east-1
 ```
 
-If you want the runtime to expose the bundled humanoid robot workers (`robot_1`..`robot_6`), set these `cdk.json` context values:
+If you want the runtime to expose the bundled humanoid robot workers (`robot_1`..`robot_6`), set these `cdk.json` context values to point to your **AWS Bedrock AgentCore Secure Gateway**:
 
 ```json
-"humanoid_mcp_server_url": "https://your-mcp-endpoint.lambda-url.us-east-1.on.aws/"
+"humanoid_mcp_server_url": "https://your-agentcore-gateway-id.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
 ```
 
-For an IAM-protected Lambda Function URL, also set:
+For an IAM-protected AgentCore Gateway (recommended), also set:
 
 ```json
 "humanoid_mcp_auth_mode": "iam",

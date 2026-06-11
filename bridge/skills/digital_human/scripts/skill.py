@@ -19,7 +19,7 @@ def normalize_auth_mode(raw_mode):
     return "iam"
 
 
-def create_auth(auth_mode, region, profile_name=""):
+def create_auth(auth_mode, region, mcp_url, profile_name=""):
     """Create a request auth object for the selected mode."""
     if auth_mode != "iam":
         return None
@@ -31,7 +31,8 @@ def create_auth(auth_mode, region, profile_name=""):
     if profile_name:
         session_kwargs["profile_name"] = profile_name
     session = boto3.Session(**session_kwargs)
-    return AWSSigV4("lambda", session=session)
+    service = "bedrock-agentcore"
+    return AWSSigV4(service, session=session)
 
 
 def build_headers(api_key_header, api_key):
@@ -75,18 +76,19 @@ def call_mcp_tool(mcp_url, auth, tool_name, arguments, timeout=30, headers=None)
 
 
 def execute_speech(mcp_url, auth, headers, message):
-    """Send a speech command to the xiaoice digital human MCP server."""
+    """Send a speech command to the digital human MCP server."""
+    tool_name = "digital-human-mcp-lambda___digital_human_speech"
     text = call_mcp_tool(
         mcp_url,
         auth,
-        "xiaoice_speech",
+        tool_name,
         {"message": message},
         headers=headers,
     )
     if text is not None:
         logger.info("speech -> %s", text)
         return True, text
-    return False, "Failed to send speech to xiaoice"
+    return False, "Failed to send speech to digital human"
 
 
 def main():
@@ -155,7 +157,7 @@ def main():
         logger.error("--api-key or MCP_API_KEY is required when --auth-mode=api-key")
         sys.exit(1)
 
-    auth = create_auth(auth_mode, args.region, args.profile)
+    auth = create_auth(auth_mode, args.region, args.mcp_url, args.profile)
     headers = build_headers(args.api_key_header, args.api_key if auth_mode == "api-key" else "")
     success, response_text = execute_speech(args.mcp_url, auth, headers, args.message)
 

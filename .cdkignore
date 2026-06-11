@@ -1,0 +1,26 @@
+# Exclude build output
+cdk.out/
+cdk.out.temp/
+
+# Exclude virtual environments
+.venv/
+.venv-review/
+venv/
+ENV/
+
+# Exclude source control
+.git/
+
+# Exclude IDEs and other tools
+.idea/
+.vscode/
+.antigravitycli/
+.claude/
+
+# Exclude dependencies and caches
+node_modules/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/

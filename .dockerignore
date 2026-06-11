@@ -3,6 +3,14 @@ node_modules/
 
 # Build output (rebuilt in container)
 dist/
+cdk.out/
+cdk.out.temp/
+
+# Virtual environments
+.venv/
+.venv-review/
+venv/
+ENV/
 
 # Version control
 .git/
@@ -18,10 +26,15 @@ npm-debug.log*
 # Testing
 coverage/
 .nyc_output/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# IDE
+# IDE and agents
 .vscode/
 .idea/
+.antigravitycli/
+.claude/
 
 # OS
 .DS_Store

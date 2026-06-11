@@ -28,7 +28,7 @@
     "enable_browser": false,
     "cron_lead_time_minutes": 5,
     "dashboard_api_push_url": "https://d6di3h13d9nok.cloudfront.net/api/openclaw/push-event",
-    "humanoid_mcp_server_url": "https://bseb2x7nywnubp2zz4sqltywv40zjfuw.lambda-url.us-east-1.on.aws/",
+    "humanoid_mcp_server_url": "https://cdkstackrobottoolgatructrobottoolgateway9a50f085-lexv1gydiq.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
     "humanoid_mcp_auth_mode": "iam",
     "humanoid_mcp_function_arn": "arn:aws:lambda:us-east-1:111964674713:function:CdkStack-LambdaMcpServerConstructMcpFunction1085FC-Dy50cJkHyOqV",
     "humanoid_mcp_api_key_header": "x-api-key",

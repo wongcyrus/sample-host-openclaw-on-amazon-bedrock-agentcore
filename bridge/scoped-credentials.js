@@ -142,7 +142,7 @@ function buildSessionPolicy({
           "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
           "kms:Decrypt", "kms:GenerateDataKey",
           "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
-          "lambda:InvokeFunction", "lambda:InvokeFunctionUrl",
+          "bedrock-agentcore:InvokeGateway",
           "iam:PassRole",
         ],
         Resource: "*",

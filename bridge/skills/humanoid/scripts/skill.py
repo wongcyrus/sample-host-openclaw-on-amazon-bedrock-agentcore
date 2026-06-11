@@ -81,7 +81,7 @@ def normalize_auth_mode(raw_mode):
     return "iam"
 
 
-def create_auth(auth_mode, region):
+def create_auth(auth_mode, region, mcp_url):
     """Create a request auth object for the selected mode."""
     if auth_mode != "iam":
         return None
@@ -90,7 +90,8 @@ def create_auth(auth_mode, region):
     from requests_auth_aws_sigv4 import AWSSigV4
 
     session = boto3.Session(region_name=region)
-    return AWSSigV4("lambda", session=session)
+    service = "bedrock-agentcore"
+    return AWSSigV4(service, session=session)
 
 
 def build_headers(api_key_header, api_key):
@@ -135,7 +136,7 @@ def call_mcp_tool(mcp_url, auth, tool_name, arguments, timeout=30, headers=None)
 
 def execute_action(mcp_url, auth, headers, robot_id, action):
     """Execute a single action against one robot."""
-    tool_name = f"robot_{action}"
+    tool_name = f"robot-only-mcp-lambda___robot_{action}"
     text = call_mcp_tool(mcp_url, auth, tool_name, {"robot_id": robot_id}, headers=headers)
     if text is not None:
         logger.info("[%s] %s -> %s", robot_id, action, text)
@@ -150,7 +151,8 @@ def execute_speech(mcp_url, auth, headers, robot_id, text, language="yue"):
         "text": text,
         "language": language,
     }
-    result = call_mcp_tool(mcp_url, auth, "robot_speak", arguments, timeout=30, headers=headers)
+    tool_name = "robot-only-mcp-lambda___robot_speak"
+    result = call_mcp_tool(mcp_url, auth, tool_name, arguments, timeout=30, headers=headers)
     if result is not None:
         logger.info("[%s] speak(%s) -> %s", robot_id, language, result)
         return True, result
@@ -161,10 +163,11 @@ def capture_image(mcp_url, auth, headers, robot_id):
     """Capture an image, download it locally, and return the file path."""
     import requests
 
+    tool_name = "robot-only-mcp-lambda___get_image"
     text = call_mcp_tool(
         mcp_url,
         auth,
-        "get_image",
+        tool_name,
         {"robot_id": robot_id},
         timeout=30,
         headers=headers,
@@ -356,7 +359,7 @@ def main():
         logger.error("--api-key or MCP_API_KEY is required when --auth-mode=api-key")
         sys.exit(1)
 
-    auth = create_auth(auth_mode, args.region)
+    auth = create_auth(auth_mode, args.region, args.mcp_url)
     headers = build_headers(args.api_key_header, args.api_key)
 
     if args.speak:
