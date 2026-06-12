@@ -1,0 +1,38 @@
+sequenceDiagram
+    autonumber
+    participant Client as Chat App Client (Telegram/Slack)
+    participant ApiGateway as API Gateway HTTP API
+    participant RouterSync as Router Lambda (Sync Validation)
+    participant RouterAsync as Router Lambda (Async Worker)
+    participant DynamoDb as DynamoDB Table (openclaw-identity)
+    participant AgentCore as Bedrock AgentCore Runtime
+
+    Client->>ApiGateway: POST /webhook/telegram (Message Payload)
+    ApiGateway->>RouterSync: Trigger handler()
+    RouterSync->>RouterSync: Validate Webhook Signature
+    
+    alt Signature Invalid
+        RouterSync-->>ApiGateway: Return 401 Unauthorized
+        ApiGateway-->>Client: 401 Unauthorized
+    else Signature Valid
+        RouterSync->>RouterAsync: Trigger Lambda (Event - Asynchronous Self-Invoke)
+        RouterSync-->>ApiGateway: Return 200 OK (Acknowledged)
+        ApiGateway-->>Client: 200 OK (Fast Acknowledgment)
+    end
+
+    Note over RouterAsync: Worker begins async processing thread
+    RouterAsync->>DynamoDb: Lookup User & Session (Query BIND# & USER#)
+    DynamoDb-->>RouterAsync: Return Session ID (or None)
+
+    alt Session ID Not Found
+        RouterAsync->>AgentCore: Create Session (StartAgentSession)
+        AgentCore-->>RouterAsync: Return New Session ID
+        RouterAsync->>DynamoDb: Write Session ID (Put BIND# item)
+    end
+
+    RouterAsync->>AgentCore: Invoke Agent Runtime (sessionId, userMessage)
+    AgentCore->>AgentCore: Process LLM reasoning & tool executions
+    AgentCore-->>RouterAsync: Return Response Payload (text & attachments)
+
+    RouterAsync->>Client: Send Message back via Outbound API (POST /sendMessage)
+    Client-->>RouterAsync: HTTP 200 OK

@@ -1,0 +1,69 @@
+graph TD
+    %% Node Definitions %%
+    subgraph Clients [End User Channels]
+        Telegram["Telegram Client"]
+        Slack["Slack Client"]
+        Feishu["Feishu Client"]
+    end
+
+    subgraph Gateways [API & Security Ingress]
+        ApiGateway["API Gateway HTTP API <br> openclaw-router"]
+        CognitoPool["Cognito User Pool <br> User Auth Portal"]
+    end
+
+    subgraph Compute [Serverless Compute]
+        RouterLambda["Router Lambda <br> openclaw-router.py"]
+        CronLambda["Cron Lambda <br> openclaw-cron.py"]
+        TokenLambda["Token Monitoring Lambda <br> token_monitor.py"]
+    end
+
+    subgraph Storage [Persistent Storage]
+        DynamoDb["DynamoDB Identity Table <br> openclaw-identity"]
+        S3Bucket["S3 User Files Bucket <br> openclaw-files-bucket"]
+        SecretsManager["AWS Secrets Manager <br> Channel & API Keys"]
+    end
+
+    subgraph VPC [Private Isolated VPC]
+        AgentCore["AgentCore Runtime Container <br> Managed Serverless microVM"]
+        VpcEndpoints["VPC Endpoints <br> Bedrock, S3, ECR, CloudWatch"]
+    end
+
+    subgraph AWS [AWS Managed Services]
+        Bedrock["Amazon Bedrock <br> LLM & Converse API"]
+        EventBridge["EventBridge Scheduler <br> Cron Trigger"]
+        CloudWatch["CloudWatch Log Groups <br> Invocation Logs"]
+    end
+
+    %% Connections %%
+    Telegram -->|1. Webhook HTTPS Post| ApiGateway
+    Slack -->|1. Webhook HTTPS Post| ApiGateway
+    Feishu -->|1. Webhook HTTPS Post| ApiGateway
+
+    ApiGateway -->|2. Route Webhook Payload| RouterLambda
+    RouterLambda -->|3. Get Secrets & Keys| SecretsManager
+    RouterLambda -->|4. Resolve Session Identity| DynamoDb
+    RouterLambda -->|5. Invoke Agent Runtime| AgentCore
+
+    AgentCore -->|6. Local S3 Gateway Endpoint| S3Bucket
+    AgentCore -->|7. Bedrock Private Endpoint| Bedrock
+    AgentCore -->|8. Push logs via Endpoint| CloudWatch
+
+    EventBridge -->|Schedule Cron| CronLambda
+    CronLambda -->|Scan Session Lifecycles| DynamoDb
+    CronLambda -->|Terminate Idle Sessions| AgentCore
+
+    CloudWatch -->|Stream Invocation Logs| TokenLambda
+
+    %% Class Applications %%
+    class RouterLambda,CronLambda,TokenLambda ComputeStyle;
+    class S3Bucket,DynamoDb,SecretsManager StorageStyle;
+    class ApiGateway,CognitoPool GatewayStyle;
+    class Telegram,Slack,Feishu ClientStyle;
+    class AgentCore VPCStyle;
+
+    %% Styling Classes %%
+    classDef ComputeStyle fill:#FF9900,stroke:#D68100,stroke-width:2px,color:#FFFFFF;
+    classDef StorageStyle fill:#1A5F7A,stroke:#103F54,stroke-width:2px,color:#FFFFFF;
+    classDef GatewayStyle fill:#008B8B,stroke:#006666,stroke-width:2px,color:#FFFFFF;
+    classDef ClientStyle fill:#4A4E69,stroke:#22223B,stroke-width:2px,color:#FFFFFF;
+    classDef VPCStyle fill:#7B2CBF,stroke:#5A189A,stroke-width:2px,color:#FFFFFF;

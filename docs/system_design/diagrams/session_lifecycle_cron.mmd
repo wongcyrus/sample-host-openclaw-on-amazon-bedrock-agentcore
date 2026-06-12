@@ -1,0 +1,25 @@
+graph TD
+    %% Node Definitions %%
+    EventBridge["AWS EventBridge Scheduler <br> Run openclaw-cron every 5m"]
+    CronLambda["Cron Lambda Function <br> openclaw-cron.py"]
+    DynamoDb["DynamoDB Identity Table <br> openclaw-identity"]
+    AgentCore["Bedrock AgentCore Runtime <br> Serverless Session Lane"]
+
+    %% Connections %%
+    EventBridge -->|1. Trigger Cron Schedule - Every 5m| CronLambda
+    CronLambda -->|2. Scan Active Session Records| DynamoDb
+    DynamoDb -->|3. Return Active Sessions with LastActive Timestamps| CronLambda
+    
+    CronLambda -->|4. Filter and Identify Idle Sessions - Idle timeout exceeded| AgentCore
+    AgentCore -->|5. Terminate and Tear Down microVM Session| AgentCore
+    CronLambda -->|6. Delete Idle Session Record| DynamoDb
+
+    %% Class Applications %%
+    class CronLambda ComputeStyle;
+    class DynamoDb StorageStyle;
+    class EventBridge,AgentCore VPCStyle;
+
+    %% Styling Classes %%
+    classDef ComputeStyle fill:#FF9900,stroke:#D68100,stroke-width:2px,color:#FFFFFF;
+    classDef StorageStyle fill:#1A5F7A,stroke:#103F54,stroke-width:2px,color:#FFFFFF;
+    classDef VPCStyle fill:#7B2CBF,stroke:#5A189A,stroke-width:2px,color:#FFFFFF;
