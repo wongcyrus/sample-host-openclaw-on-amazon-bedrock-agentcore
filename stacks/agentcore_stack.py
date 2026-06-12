@@ -510,8 +510,8 @@ class AgentCoreStack(Stack):
         )
         suffix = namer.suffix
         # Minimum allowed by Bedrock AgentCore is 60 seconds.
-        # Dev: 10 minutes (600s) | Non-dev default: 30 minutes (1800s)
-        default_max_lifetime = "600" if suffix == "dev" else "1800"
+        # Dev: 30 minutes (1800s) | Non-dev default: 60 minutes (3600s)
+        default_max_lifetime = "1800" if suffix == "dev" else "3600"
         session_max_lifetime = int(
             self.node.try_get_context("session_max_lifetime") or default_max_lifetime
         )

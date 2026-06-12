@@ -25,7 +25,7 @@
     "cron_lambda_timeout_seconds": 900,
     "cron_lambda_memory_mb": 256,
     "enable_cloudtrail": false,
-    "enable_browser": false,
+    "enable_browser": true,
     "cron_lead_time_minutes": 5,
     "dashboard_api_push_url": "https://d6di3h13d9nok.cloudfront.net/api/openclaw/push-event",
     "humanoid_mcp_server_url": "https://cdkstackrobottoolgatructrobottoolgateway9a50f085-lexv1gydiq.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
