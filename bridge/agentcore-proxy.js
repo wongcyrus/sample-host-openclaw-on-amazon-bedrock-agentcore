@@ -1559,8 +1559,8 @@ const server = http.createServer(async (req, res) => {
         );
 
         // Build augmented system text with user identity + memory context.
-        // Identity is ALWAYS injected; memory context may be empty string.
-        const identityContext = await buildUserIdentityContext(
+        // Identity is ONLY injected for the main agent; subagents load their own workspace natively.
+        const identityContext = isSubagent ? "" : await buildUserIdentityContext(
           actorId,
           channel,
         );

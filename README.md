@@ -966,6 +966,8 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
 
 The agent runs with OpenClaw's **full tool profile** enabled, giving it access to built-in tool groups (web, filesystem, runtime, sessions, automation). Six custom skills are included:
 
+> 📚 **Want to add your own skills?** Check out the [Guide to Adding Skills](docs/adding-skills.md).
+
 | Skill | Purpose |
 |---|---|
 | `eventbridge-cron` | Cron scheduling via EventBridge Scheduler — create, update, and delete recurring tasks |

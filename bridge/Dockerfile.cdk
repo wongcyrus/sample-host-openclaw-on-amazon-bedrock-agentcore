@@ -116,6 +116,9 @@ RUN chmod +x /skills/agentcore-browser/*.js
 COPY bridge/skills/humanoid /skills/humanoid
 RUN chmod +x /skills/humanoid/run.sh
 
+COPY bridge/skills/digital_human /skills/digital_human
+RUN chmod +x /skills/digital_human/run.sh
+
 COPY CLAUDE.md /app/CLAUDE.md
 COPY bridge/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

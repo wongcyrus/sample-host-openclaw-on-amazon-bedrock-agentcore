@@ -752,7 +752,7 @@ function writeOpenClawConfig() {
   const domainCommentatorAgent = {
     id: DOMAIN_COMMENTATOR_AGENT_ID,
     name: "Domain Arena Commentator",
-    model: PRIMARY_MODEL,
+    model: subagentModel,
     skills: ["digital_human"],
     identity: { name: "Domain Arena Commentator" },
     workspace: buildAgentWorkspaceDir(homeDir, DOMAIN_COMMENTATOR_AGENT_ID),
@@ -778,12 +778,12 @@ function writeOpenClawConfig() {
   const communicationManagerAgent = {
     id: COMMUNICATION_MANAGER_AGENT_ID,
     name: "communication-manager",
-    model: PRIMARY_MODEL,
+    model: subagentModel,
     skills: ["digital_human"],
     identity: { name: "communication-manager" },
     workspace: buildAgentWorkspaceDir(homeDir, COMMUNICATION_MANAGER_AGENT_ID),
     tools: {
-      profile: "coding",
+      profile: "full",
       deny: ["subagents"],
       elevated: {
         enabled: true,
@@ -801,7 +801,7 @@ function writeOpenClawConfig() {
     ? HUMANOID_ROBOT_IDS.map((robotId, index) => ({
       id: robotId,
       name: `Robot ${index + 1}`,
-      model: PRIMARY_MODEL,
+      model: subagentModel,
       skills: ["humanoid"],
       identity: { name: `Robot ${index + 1}` },
       workspace: buildAgentWorkspaceDir(homeDir, robotId),
