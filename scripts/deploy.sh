@@ -397,6 +397,7 @@ STACK_AGENTCORE="$(with_suffix OpenClawAgentCore)"
 STACK_ROUTER="$(with_suffix OpenClawRouter)"
 STACK_CRON="$(with_suffix OpenClawCron)"
 STACK_TOKEN_MONITORING="$(with_suffix OpenClawTokenMonitoring)"
+STACK_ADMIN_DASHBOARD="$(with_suffix OpenClawAdminDashboard)"
 telegram_setup_attempted=0
 
 # Resolve account and region
@@ -532,6 +533,7 @@ phase3_cdk() {
   local stacks=(
     "$STACK_ROUTER"
     "$STACK_CRON"
+    "$STACK_ADMIN_DASHBOARD"
   )
   if [ "$OPENCLAW_ENV_SUFFIX" != "dev" ]; then
     stacks+=("$STACK_TOKEN_MONITORING")

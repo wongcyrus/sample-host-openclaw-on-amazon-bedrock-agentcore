@@ -55,9 +55,9 @@ Network behavior is currently **suffix-based in code**:
 
 **Why it matters**: The VPC-mode path gives stronger network isolation and keeps AWS API traffic on the AWS backbone via VPC endpoints. The `dev` path does **not** have that extra network layer, but it is still protected by IAM-authenticated runtime access, Router Lambda entry, webhook validation, per-user isolation, scoped credentials, and TLS.
 
-### 3.2 API Gateway & Webhook Security
+### 3.2 API Gateway, Webhook, and Dashboard Security
 
-The Router API Gateway HTTP API uses explicit routes — only three paths are exposed. All other paths return 404 from API Gateway without invoking Lambda.
+The OpenClaw application utilizes multiple API Gateways. The main Router API Gateway HTTP API uses explicit routes — only three paths are exposed. All other paths return 404 from API Gateway without invoking Lambda. The Admin Dashboard uses its own API Gateway.
 
 | Control | Implementation |
 |---|---|
@@ -68,8 +68,9 @@ The Router API Gateway HTTP API uses explicit routes — only three paths are ex
 | Telegram validation | `X-Telegram-Bot-Api-Secret-Token` header checked via `hmac.compare_digest()` (constant-time comparison). Fail-closed: rejects if no secret configured |
 | Slack validation | `X-Slack-Signature` HMAC-SHA256 with `v0:{timestamp}:{body}` base string. 5-minute replay window rejects stale requests. Fail-closed: rejects if no signing secret configured |
 | Async dispatch | Router Lambda self-invokes with `InvocationType=Event`, returns 200 immediately to webhook callers |
+| Admin Dashboard Auth | The Admin API handles `GET /` and `/api/*` endpoints. Protected using **HTTP Basic Authentication**. The credentials (`admin` / randomly generated password) are stored in AWS Secrets Manager and requested by the browser. |
 
-**Key detail**: Both Telegram and Slack webhook validators use `hmac.compare_digest()` for constant-time comparison, preventing timing side-channel attacks.
+**Key detail**: Both Telegram and Slack webhook validators use `hmac.compare_digest()` for constant-time comparison, preventing timing side-channel attacks. The Admin Dashboard implements least privilege IAM execution roles (e.g. limiting Bedrock AgentCore calls specifically to the deployed Runtime ARN).
 
 ### 3.3 Identity & Access Control
 

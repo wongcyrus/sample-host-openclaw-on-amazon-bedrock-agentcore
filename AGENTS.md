@@ -100,3 +100,4 @@ _(updated during loop — add lessons learned here)_
 - Check `enable_guardrails` context with `self.node.try_get_context("enable_guardrails")`, default to `True`
 - Bedrock AgentCore in `us-east-1` only supports physical AZ IDs: `use1-az1`, `use1-az2`, `use1-az4`. `us-east-1a` (often `use1-az6`) is unsupported.
 - `VpcStack` now auto-discovers supported logical AZs in `us-east-1` using `boto3` to filter by `zone-id`.
+- Bedrock AgentCore sessions must be stopped using `bedrock-agentcore:StopRuntimeSession` (with both the session string ID and the Agent Runtime ARN), not the standard `bedrock-agent-runtime:EndSession` API. Failed session deletions usually return `ResourceNotFoundException`.

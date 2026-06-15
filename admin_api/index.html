@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenClaw Admin Dashboard</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f6; margin: 0; padding: 0; }
+        .container { max-width: 900px; margin: 40px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { color: #333; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
+        th { background: #007bff; color: white; }
+        .btn { padding: 8px 12px; background: #dc3545; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .btn:hover { background: #c82333; }
+        .btn-global { background: #ffc107; font-size: 16px; margin-bottom: 20px; padding: 12px 20px; }
+        .btn-global:hover { background: #e0a800; }
+        #message { margin-top: 20px; color: green; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>OpenClaw Admin Dashboard</h1>
+        <button class="btn btn-global" onclick="globalReset()">🧨 Hard Reset All Users</button>
+        <p>Active Bedrock AgentCore Sessions:</p>
+        <table>
+            <thead>
+                <tr>
+                    <th>User ID</th>
+                    <th>Session ID</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="session-table-body">
+                <tr><td colspan="4">Loading sessions...</td></tr>
+            </tbody>
+        </table>
+        <div id="message"></div>
+    </div>
+
+    <script>
+        async function fetchSessions() {
+            try {
+                const response = await fetch('/api/sessions');
+                if (!response.ok) throw new Error('Failed to fetch sessions');
+                const sessions = await response.json();
+                const tbody = document.getElementById('session-table-body');
+                tbody.innerHTML = '';
+                
+                if (sessions.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4">No active sessions found.</td></tr>';
+                    return;
+                }
+
+                sessions.forEach(s => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td>${s.userId}</td>
+                        <td>${s.sessionId}</td>
+                        <td>${s.status}</td>
+                        <td>
+                            <button class="btn" style="background:#dc3545;" onclick="endSession('${s.userId}')">End Session</button>
+                            <button class="btn" style="background:#17a2b8;" onclick="cleanLocks('${s.userId}')">Clean Locks</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch (error) {
+                document.getElementById('session-table-body').innerHTML = `<tr><td colspan="4" style="color:red;">Error: ${error.message}</td></tr>`;
+            }
+        }
+
+        async function endSession(userId) {
+            if (!confirm(`Are you sure you want to end session for user ${userId}? This will stop their Bedrock container and remove their session map.`)) return;
+            showMessage('Ending session...');
+            try {
+                const response = await fetch(`/api/session/end/user/${encodeURIComponent(userId)}`, { method: 'POST' });
+                if (!response.ok) throw new Error('Failed to end session');
+                showMessage(`Session for user ${userId} successfully ended!`);
+                fetchSessions();
+            } catch (error) {
+                showMessage(`Error: ${error.message}`, true);
+            }
+        }
+
+        async function cleanLocks(userId) {
+            if (!confirm(`Are you sure you want to clean locks for user ${userId}? This clears stale S3 locks so they can type again.`)) return;
+            showMessage('Cleaning locks...');
+            try {
+                const response = await fetch(`/api/session/unlock/user/${encodeURIComponent(userId)}`, { method: 'POST' });
+                if (!response.ok) throw new Error('Failed to clean locks');
+                showMessage(`Locks for user ${userId} successfully cleaned!`);
+            } catch (error) {
+                showMessage(`Error: ${error.message}`, true);
+            }
+        }
+
+        async function globalReset() {
+            if (!confirm(`WARNING: Are you sure you want to perform a hard reset? This stops all sessions and clears all locks.`)) return;
+            showMessage('Performing hard reset... this may take up to a minute.');
+            try {
+                const response = await fetch(`/api/reset/global`, { method: 'POST' });
+                if (!response.ok) throw new Error('Failed to hard reset');
+                showMessage(`Hard reset complete!`);
+                fetchSessions();
+            } catch (error) {
+                showMessage(`Error: ${error.message}`, true);
+            }
+        }
+
+        function showMessage(msg, isError = false) {
+            const msgDiv = document.getElementById('message');
+            msgDiv.textContent = msg;
+            msgDiv.style.color = isError ? 'red' : 'green';
+            setTimeout(() => { msgDiv.textContent = ''; }, 5000);
+        }
+
+        fetchSessions();
+    </script>
+</body>
+</html>

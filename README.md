@@ -42,6 +42,7 @@ Users can send **text and images** — photos sent via Telegram or Slack are dow
 - AWS Bedrock Guardrails — content filtering, PII redaction, topic denial, word filters, prompt attack detection
 - LLM red team testing — 62 test cases across 12 attack categories via promptfoo
 - App-level security E2E tests (TestGuardrailSecurity — 6 tests through the full Telegram webhook pipeline)
+- **Admin Dashboard** — Basic Auth secured UI for tracking and gracefully terminating per-user AgentCore sessions globally or individually.
 
 ## Architecture
 
@@ -62,6 +63,7 @@ flowchart LR
         BEDROCK[Amazon Bedrock<br/>Kimi]
         CRON[EventBridge<br/>Scheduler]
         CRONLAMBDA[Cron Lambda]
+        ADMIN[Admin Dashboard<br/>Lambda]
     end
 
     TG & SL <-->|webhooks| APIGW
@@ -72,6 +74,8 @@ flowchart LR
     CRON --> CRONLAMBDA
     CRONLAMBDA <--> AGENT
     CRONLAMBDA -->|Bot API| TG & SL
+    ADMIN -->|Manage Sessions| AGENT
+    ADMIN -->|Manage Identity| DDB
 ```
 
 **How it works:** Messages from Telegram/Slack hit the Router Lambda, which resolves user identity and routes to a per-user AgentCore container. Each user gets isolated compute, persistent workspace, and access to the configured Bedrock model.

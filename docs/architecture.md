@@ -345,16 +345,16 @@
                     │ Core          │
                     └───────┬───────┘
                             │
-              ┌─────────────┼─────────────┐
-              │             │             │
-      ┌───────v───────┐     │     ┌───────v───────┐
-      │ OpenClawRouter│     │     │ OpenClawCron  │
-      └───────────────┘     │     └───────────────┘
-                            │
-  OpenClawObservability ────┤
-                            │
-                    ┌───────v───────┐
-                    │ OpenClawToken │
+              ┌─────────────┼─────────────┬─────────────┐
+              │             │             │             │
+      ┌───────v───────┐     │     ┌───────v───────┐     │
+      │ OpenClawRouter│     │     │ OpenClawCron  │     │
+      └───────────────┘     │     └───────────────┘     │
+                            │                           │
+  OpenClawObservability ────┤                   ┌───────v───────┐
+                            │                   │ OpenClawAdmin │
+                    ┌───────v───────┐           │ Dashboard     │
+                    │ OpenClawToken │           └───────────────┘
                     │ Monitoring    │
                     └───────────────┘
 ```
@@ -367,6 +367,7 @@
 | API Gateway | Throttling | Burst: 50, sustained: 100 req/s |
 | Webhook | Telegram validation | `X-Telegram-Bot-Api-Secret-Token` header against Secrets Manager secret |
 | Webhook | Slack validation | `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window |
+| Dashboard | Admin Basic Auth | Admin Dashboard endpoints secured via HTTP Basic Auth (auto-rotated secret in Secrets Manager) |
 | Network | `environment_suffix != "dev"` | AgentCore runtime uses VPC mode, private subnets, NAT, and VPC endpoints |
 | Network | `environment_suffix == "dev"` | AgentCore runtime uses public network mode; VPC stack is public-subnets-only with no NAT and no VPC endpoints |
 | Network | SG egress HTTPS only | In VPC mode, container outbound traffic is restricted to TCP 443 |

@@ -28,6 +28,7 @@ from stacks.guardrails_stack import GuardrailsStack
 from stacks.cron_stack import CronStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.token_monitoring_stack import TokenMonitoringStack
+from stacks.admin_stack import AdminDashboardStack
 
 app = cdk.App()
 namer = DeploymentNamer.from_scope(app)
@@ -162,6 +163,18 @@ if namer.suffix != "dev":
         cmk_arn=security_cmk_arn,
         env=env,
     )
+
+# --- Admin Dashboard ---
+admin_stack = AdminDashboardStack(
+    app,
+    namer.stack("OpenClawAdminDashboard"),
+    identity_table_name=_identity_table_name,
+    user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
+    cmk_arn=security_cmk_arn,
+    runtime_arn_parameter_name=agentcore_stack.runtime_arn_parameter.parameter_name,
+    runtime_endpoint_parameter_name=agentcore_stack.runtime_endpoint_parameter.parameter_name,
+    env=env,
+)
 
 # --- cdk-nag security checks ---
 cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))
