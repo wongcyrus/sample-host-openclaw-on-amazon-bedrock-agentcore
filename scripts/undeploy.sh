@@ -812,10 +812,18 @@ if ! aws cloudformation describe-stacks \
   echo "No matching OpenClaw stacks found in $REGION."
 else
   stop_agentcore_runtime_sessions
-  destroy_stack_group "$STACK_ROUTER" "$STACK_CRON" "$STACK_TOKEN_MONITORING"
+  local phase3_stacks=("$STACK_ROUTER" "$STACK_CRON")
+  if [ "$OPENCLAW_ENV_SUFFIX" != "dev" ]; then
+    phase3_stacks+=("$STACK_TOKEN_MONITORING")
+  fi
+  destroy_stack_group "${phase3_stacks[@]}"
+  
   destroy_agentcore_stack
   destroy_guardrails_stack
-  destroy_stack_group "$STACK_OBSERVABILITY"
+  
+  if [ "$OPENCLAW_ENV_SUFFIX" != "dev" ]; then
+    destroy_stack_group "$STACK_OBSERVABILITY"
+  fi
 
   if stack_exists "$STACK_VPC"; then
     wait_for_agentcore_enis "$VPC_ID"

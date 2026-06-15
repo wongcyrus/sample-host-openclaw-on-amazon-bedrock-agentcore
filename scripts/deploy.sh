@@ -492,11 +492,17 @@ phase1_cdk() {
   cd "$PROJECT_DIR"
   activate_venv
 
+  local stacks=(
+    "$STACK_VPC"
+    "$STACK_SECURITY"
+    "$STACK_GUARDRAILS"
+  )
+  if [ "$OPENCLAW_ENV_SUFFIX" != "dev" ]; then
+    stacks+=("$STACK_OBSERVABILITY")
+  fi
+
   cdk deploy \
-    "$STACK_VPC" \
-    "$STACK_SECURITY" \
-    "$STACK_GUARDRAILS" \
-    "$STACK_OBSERVABILITY" \
+    "${stacks[@]}" \
     "${CDK_DEPLOY_FLAGS[@]}"
 
   echo "  Phase 1 complete."
@@ -523,10 +529,16 @@ phase3_cdk() {
   cd "$PROJECT_DIR"
   activate_venv
 
+  local stacks=(
+    "$STACK_ROUTER"
+    "$STACK_CRON"
+  )
+  if [ "$OPENCLAW_ENV_SUFFIX" != "dev" ]; then
+    stacks+=("$STACK_TOKEN_MONITORING")
+  fi
+
   cdk deploy \
-    "$STACK_ROUTER" \
-    "$STACK_CRON" \
-    "$STACK_TOKEN_MONITORING" \
+    "${stacks[@]}" \
     "${CDK_DEPLOY_FLAGS[@]}"
 
   echo "  Phase 3 complete."

@@ -10,6 +10,7 @@ from aws_cdk import (
     Duration,
     Stack,
     RemovalPolicy,
+    CustomResource,
     aws_bedrockagentcore as agentcore,
     aws_ec2 as ec2,
     aws_ecr_assets as ecr_assets,
@@ -18,6 +19,8 @@ from aws_cdk import (
     aws_s3 as s3,
     aws_s3_deployment as s3_deployment,
     aws_ssm as ssm,
+    aws_lambda as lambda_,
+    custom_resources as cr,
 )
 import cdk_nag
 from constructs import Construct
@@ -661,6 +664,77 @@ class AgentCoreStack(Stack):
             string_value=self.runtime_endpoint_id,
         )
 
+        # --- Vended Log Cleanup Custom Resource -------------------------------
+        # Bedrock AgentCore can accumulate vended log deliveries that are costly.
+        # This custom resource executes on deployment to clean them up.
+        cleanup_role = iam.Role(
+            self,
+            "CleanupVendedLogsRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole")
+            ]
+        )
+        cleanup_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "logs:DescribeDeliveries",
+                    "logs:GetDeliverySource",
+                    "logs:DeleteDelivery",
+                    "logs:DeleteDeliverySource",
+                ],
+                resources=["*"]
+            )
+        )
+        
+        cleanup_code = """import boto3
+
+def handler(event, context):
+    try:
+        if event['RequestType'] in ['Create', 'Update']:
+            logs = boto3.client('logs')
+            deliveries = logs.describe_deliveries().get('deliveries', [])
+            for delivery in deliveries:
+                try:
+                    delivery_id = delivery['id']
+                    source_name = delivery['deliverySourceName']
+                    source_info = logs.get_delivery_source(name=source_name).get('deliverySource', {})
+                    if source_info.get('service') == 'bedrock-agentcore':
+                        print(f"Deleting delivery {delivery_id} for {source_name}")
+                        logs.delete_delivery(id=delivery_id)
+                        logs.delete_delivery_source(name=source_name)
+                except Exception as e:
+                    print(f"Error cleaning up delivery: {e}")
+    except Exception as e:
+        print(f"Overall error: {e}")
+    return {"PhysicalResourceId": "vended-logs-cleanup"}
+"""
+        cleanup_lambda = lambda_.Function(
+            self,
+            "CleanupVendedLogsLambda",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="index.handler",
+            code=lambda_.Code.from_inline(cleanup_code),
+            role=cleanup_role,
+            timeout=Duration.seconds(300),
+        )
+        
+        cleanup_provider = cr.Provider(
+            self,
+            "CleanupVendedLogsProvider",
+            on_event_handler=cleanup_lambda,
+        )
+        
+        cleanup_cr = CustomResource(
+            self,
+            "CleanupVendedLogsCustomResource",
+            service_token=cleanup_provider.service_token,
+            properties={
+                "RuntimeName": self.runtime.agent_runtime_name
+            }
+        )
+        cleanup_cr.node.add_dependency(self.runtime)
+
         # --- Outputs ----------------------------------------------------------
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
         CfnOutput(self, "RuntimeArn", value=self.runtime.agent_runtime_arn)
@@ -701,6 +775,8 @@ class AgentCoreStack(Stack):
                     "do not support resource-level permissions. Cognito scoped to "
                     "specific user pool.",
                     applies_to=[
+                        "Resource::<CleanupVendedLogsLambda*.Arn>:*",
+                        "Resource::<*VendedLogs*.Arn>:*",
                         "Resource::arn:aws:bedrock:*::foundation-model/*",
                         f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
                         "Resource::arn:aws:bedrock:*::inference-profile/*",
@@ -738,6 +814,67 @@ class AgentCoreStack(Stack):
                 ),
             ],
             apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            cleanup_role,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM4",
+                    reason="Cleanup Lambda uses AWSLambdaBasicExecutionRole for logging.",
+                    applies_to=[
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="Cleanup Lambda needs wildcard to discover and delete deliveries.",
+                    applies_to=["Resource::*"],
+                ),
+            ],
+            apply_to_children=True,
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"/{construct_id}/CleanupVendedLogsLambda/Resource",
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason="Lambda runtime is set to Python 3.12, which is supported.",
+                ),
+            ],
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"/{construct_id}/CleanupVendedLogsProvider/framework-onEvent/Resource",
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-L1",
+                    reason="CDK cr.Provider manages its own runtime version.",
+                ),
+            ],
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"/{construct_id}/CleanupVendedLogsProvider/framework-onEvent/ServiceRole/Resource",
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM4",
+                    reason="CDK cr.Provider uses AWSLambdaBasicExecutionRole.",
+                    applies_to=[
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                    ],
+                ),
+            ],
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"/{construct_id}/CleanupVendedLogsProvider/framework-onEvent/ServiceRole/DefaultPolicy/Resource",
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="CDK cr.Provider uses wildcard permissions internally.",
+                ),
+            ],
         )
         cdk_nag.NagSuppressions.add_resource_suppressions(
             self.user_files_bucket,

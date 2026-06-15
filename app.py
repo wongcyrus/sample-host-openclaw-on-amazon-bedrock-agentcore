@@ -145,22 +145,23 @@ cron_stack = CronStack(
 )
 
 # --- Observability (dashboards + alarms) ---
-observability_stack = ObservabilityStack(
-    app,
-    namer.stack("OpenClawObservability"),
-    cmk_arn=security_cmk_arn,
-    env=env,
-)
+if namer.suffix != "dev":
+    observability_stack = ObservabilityStack(
+        app,
+        namer.stack("OpenClawObservability"),
+        cmk_arn=security_cmk_arn,
+        env=env,
+    )
 
-# --- Token Monitoring ---
-token_monitoring_stack = TokenMonitoringStack(
-    app,
-    namer.stack("OpenClawTokenMonitoring"),
-    invocation_log_group=observability_stack.invocation_log_group,
-    alarm_topic=observability_stack.alarm_topic,
-    cmk_arn=security_cmk_arn,
-    env=env,
-)
+    # --- Token Monitoring ---
+    token_monitoring_stack = TokenMonitoringStack(
+        app,
+        namer.stack("OpenClawTokenMonitoring"),
+        invocation_log_group=observability_stack.invocation_log_group,
+        alarm_topic=observability_stack.alarm_topic,
+        cmk_arn=security_cmk_arn,
+        env=env,
+    )
 
 # --- cdk-nag security checks ---
 cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))
