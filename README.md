@@ -1159,6 +1159,10 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **Image upload size limit**: Bedrock Converse API limits images to 3.75 MB. The Router Lambda checks this before uploading to S3.
 - **OpenClaw gateway protocol version**: Current OpenClaw gateway clients connect with protocol `4`. The contract bridge now defaults to protocol `4` and retries once with the server-advertised `expectedProtocol` on `PROTOCOL_MISMATCH`, which avoids intermittent `Auth failed: protocol mismatch` errors during mixed-version rollouts or stale sessions.
 - **OpenClaw 2026.5.19 WebSocket origin enforcement**: OpenClaw enforces origin checks on all WebSocket connections carrying an `Origin` header. The `ws` Node.js library must use the `origin` **option** (not `headers.Origin`) to correctly set the header on the HTTP upgrade request. The `controlUi` config requires `allowedOrigins: ["*"]` to accept the origin. Without both the client `origin` option and config `allowedOrigins`, connections fail with: `Auth failed: origin not allowed`.
+## Utility Scripts
+
+- **`python scripts/clean_all_sessions.py [env]`**: Scans the deployed OpenClaw user files S3 bucket for the given environment (defaults to `dev`) and deletes all AgentCore session records and `.lock` files. Useful for resolving "session file locked" errors across all users.
+- **`python scripts/stop_bedrock_sessions.py`**: Queries the AWS Bedrock Agent Runtime APIs and cleanly ends all `ACTIVE` sessions across your AWS account. This gracefully halts inference loops without destroying the underlying memory data on AWS.
 
 ## Cleanup
 
