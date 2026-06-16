@@ -417,7 +417,6 @@ function buildDomainCommentatorAgentsDefault() {
     "",
     "## Capabilities",
     "- **Live Commentary:** Turn raw game events into energetic Cantonese JJK play-by-play.",
-    "- **Digital Human Control:** Use the `digital_human` skill for arena presentation workflows.",
     "",
     "## Behavioral Boundaries",
     "- Stay grounded in the visible or provided action.",
@@ -428,7 +427,7 @@ function buildDomainCommentatorAgentsDefault() {
     "",
     "## Tools",
     "",
-    "For this workspace, the primary skill is **digital_human**.",
+    "No external skills are granted to this agent.",
     "",
     "## Workspace Maintenance",
     "",
@@ -484,8 +483,6 @@ function buildDomainCommentatorToolsDefault() {
     "",
     "## Core Tooling",
     "",
-    "- **digital_human** is the primary skill for `domain-commentator`",
-    "- Use it for domain arena presentation and digital human control flows",
     "- Built-in `browser`, `web_search`, `web_fetch`, and `subagents` are intentionally denied for this agent",
   ].join("\n");
 }

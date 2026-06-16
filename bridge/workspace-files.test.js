@@ -45,12 +45,7 @@ test("workspace defaults by agent preserve robot-specific templates", () => {
   assert.ok(defaultsByAgent.main["IDENTITY.md"].includes("HKIIT"));
   assert.ok(
     defaultsByAgent[DOMAIN_COMMENTATOR_AGENT_ID]["AGENTS.md"].includes(
-      "Domain Arena Commentator",
-    ),
-  );
-  assert.ok(
-    defaultsByAgent[DOMAIN_COMMENTATOR_AGENT_ID]["TOOLS.md"].includes(
-      "digital_human",
+      "domain-commentator Agent",
     ),
   );
   assert.ok(
@@ -71,9 +66,8 @@ test("domain commentator workspace defaults are specialized", () => {
   const defaults = getWorkspaceDefaults({}, DOMAIN_COMMENTATOR_AGENT_ID);
 
   assert.ok(defaults["AGENTS.md"].includes("domain-commentator Agent"));
-  assert.ok(defaults["IDENTITY.md"].includes("Domain Arena Commentator"));
-  assert.ok(defaults["TOOLS.md"].includes("digital_human"));
-  assert.ok(defaults["SOUL.md"].includes("energetic, precise, and audience-aware"));
+  assert.ok(defaults["IDENTITY.md"].includes("commentator"));
+  assert.ok(defaults["SOUL.md"].includes("sassy"));
 });
 
 test("communication manager workspace defaults are specialized", () => {

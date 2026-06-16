@@ -753,7 +753,6 @@ function writeOpenClawConfig() {
     id: DOMAIN_COMMENTATOR_AGENT_ID,
     name: "Domain Arena Commentator",
     model: subagentModel,
-    skills: ["digital_human"],
     identity: { name: "Domain Arena Commentator" },
     workspace: buildAgentWorkspaceDir(homeDir, DOMAIN_COMMENTATOR_AGENT_ID),
     tools: {
