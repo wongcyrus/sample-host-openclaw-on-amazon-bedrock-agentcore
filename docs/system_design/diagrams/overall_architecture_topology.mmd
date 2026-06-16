@@ -8,6 +8,7 @@ graph TD
 
     subgraph Gateways [API & Security Ingress]
         ApiGateway["API Gateway HTTP API <br> openclaw-router"]
+        AdminApiGateway["Admin API Gateway <br> HTTP Basic Auth"]
         CognitoPool["Cognito User Pool <br> User Auth Portal"]
     end
 
@@ -15,6 +16,7 @@ graph TD
         RouterLambda["Router Lambda <br> openclaw-router.py"]
         CronLambda["Cron Lambda <br> openclaw-cron.py"]
         TokenLambda["Token Monitoring Lambda <br> token_monitor.py"]
+        AdminLambda["Admin Lambda <br> openclaw-admin.py"]
     end
 
     subgraph Storage [Persistent Storage]
@@ -54,10 +56,14 @@ graph TD
 
     CloudWatch -->|Stream Invocation Logs| TokenLambda
 
+    AdminApiGateway -->|Auth & Route| AdminLambda
+    AdminLambda -->|End Sessions| AgentCore
+    AdminLambda -->|Read/Delete Sessions| DynamoDb
+
     %% Class Applications %%
-    class RouterLambda,CronLambda,TokenLambda ComputeStyle;
+    class RouterLambda,CronLambda,TokenLambda,AdminLambda ComputeStyle;
     class S3Bucket,DynamoDb,SecretsManager StorageStyle;
-    class ApiGateway,CognitoPool GatewayStyle;
+    class ApiGateway,AdminApiGateway,CognitoPool GatewayStyle;
     class Telegram,Slack,Feishu ClientStyle;
     class AgentCore VPCStyle;
 
