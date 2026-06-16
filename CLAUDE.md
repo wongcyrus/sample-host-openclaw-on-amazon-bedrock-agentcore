@@ -180,6 +180,7 @@ openclaw-on-agentcore/
 | **OpenClawRouter** | Lambda, API Gateway HTTP API (explicit routes, throttling), DynamoDB identity table | AgentCore, Security |
 | **OpenClawObservability** | Operations dashboard, alarms, SNS, Bedrock invocation logging | None |
 | **OpenClawTokenMonitoring** | DynamoDB (single-table, 4 GSIs), Lambda processor, analytics dashboard | Observability |
+| **OpenClawAdminDashboard** | API Gateway and Admin Lambda for session management | Router |
 | **OpenClawCron** | EventBridge Scheduler group, Cron executor Lambda, Scheduler IAM role | AgentCore, Router, Security |
 
 ## Expected Commands
@@ -213,7 +214,7 @@ This phase builds/publishes the container asset, uploads `bootstrap/managed-work
 
 #### Phase 3: CDK dependent stacks
 ```bash
-cdk deploy OpenClawRouter OpenClawCron OpenClawTokenMonitoring --require-approval never
+cdk deploy OpenClawRouter OpenClawCron OpenClawTokenMonitoring OpenClawAdminDashboard --require-approval never
 ```
 
 ### Other CDK commands

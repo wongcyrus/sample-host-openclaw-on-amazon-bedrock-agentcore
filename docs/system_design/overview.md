@@ -43,11 +43,11 @@ As defined in `app.py`, the CDK application deploys the solution deterministical
 graph TD
     Phase1["Phase 1: Foundations <br> (VpcStack, SecurityStack, GuardrailsStack, ObservabilityStack)"]
     Phase2["Phase 2: Runtimes <br> (AgentCoreStack - Role, S3, microVMs)"]
-    Phase3["Phase 3: Connectors <br> (RouterStack, CronStack, TokenMonitoringStack)"]
+    Phase3["Phase 3: Connectors <br> (RouterStack, CronStack, TokenMonitoringStack, AdminDashboardStack)"]
 
     Phase1 --> Phase2 --> Phase3
 ```
 
 - **Phase 1 (Foundations)**: Deploys the isolated VPC, KMS Customer Managed Keys, Secrets Manager targets, Cognito User/Identity Pools, Amazon Bedrock Guardrails, and CloudWatch log groups.
 - **Phase 2 (Runtimes)**: Instantiates the Bedrock AgentCore runtime execution IAM Roles, Security Groups, S3 User Files Buckets, and private VPC Endpoints.
-- **Phase 3 (Connectors)**: Deploys the public HTTP API Gateway, Router Lambda, EventBridge scheduler, Cron Lambda, and Token Monitoring analyzer.
+- **Phase 3 (Connectors)**: Deploys the public HTTP API Gateway, Router Lambda, EventBridge scheduler, Cron Lambda, Token Monitoring analyzer, and Admin Dashboard.

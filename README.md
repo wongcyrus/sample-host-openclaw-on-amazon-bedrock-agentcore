@@ -397,7 +397,7 @@ By default, this repository uses **unsuffixed** stack names unless you set `OPEN
 The deploy script runs three phases automatically:
 1. **Phase 1 (CDK)** — VPC, Security, Guardrails, Observability stacks
 2. **Phase 2 (CDK)** — AgentCore runtime stack (container asset, managed-workspace bootstrap `BucketDeployment`, runtime, endpoint, browser, session storage). The runtime is explicitly ordered after the bootstrap upload.
-3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring stacks
+3. **Phase 3 (CDK)** — Router, Cron, TokenMonitoring, AdminDashboard stacks
 
 The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, Docker when needed, and required deployment setting validation) before starting.
 

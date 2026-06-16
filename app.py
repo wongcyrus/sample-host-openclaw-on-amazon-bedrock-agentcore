@@ -8,7 +8,7 @@ idle-terminate naturally.
 Deployment model:
   Phase 1 (CDK): VPC, Security, Guardrails, Observability
   Phase 2 (CDK): AgentCore runtime stack (Role/SG/S3/Runtime/Endpoint/Browser)
-  Phase 3 (CDK): Router, Cron, TokenMonitoring
+  Phase 3 (CDK): Router, Cron, TokenMonitoring, AdminDashboard
 """
 
 import os
