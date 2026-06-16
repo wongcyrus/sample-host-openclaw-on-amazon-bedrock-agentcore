@@ -611,6 +611,8 @@ class AgentCoreStack(Stack):
                 "node_modules",
                 ".pytest_cache",
                 "__pycache__",
+                "docs",
+                "tests",
             ],
         )
 
