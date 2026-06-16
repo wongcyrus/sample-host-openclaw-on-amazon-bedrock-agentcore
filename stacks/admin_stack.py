@@ -104,11 +104,25 @@ class AdminDashboardStack(Stack):
             )
         )
 
-        # Least privilege: KMS
+        # Least privilege: KMS for secrets
         admin_lambda.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["kms:Decrypt", "kms:GenerateDataKey"],
                 resources=[cmk_arn]
+            )
+        )
+
+        # Least privilege: KMS for DynamoDB (handles imported tables with unknown CMKs)
+        admin_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt", "kms:GenerateDataKey"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "kms:CallerAccount": self.account,
+                        "kms:ViaService": f"dynamodb.{self.region}.amazonaws.com"
+                    }
+                }
             )
         )
 
