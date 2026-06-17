@@ -26,6 +26,7 @@ DIAGRAMS=(
   "overall_architecture_topology"
   "router_webhook_flow"
   "session_lifecycle_cron"
+  "aws_blog_dashboard_relay"
 )
 
 # Run compilation for each diagram

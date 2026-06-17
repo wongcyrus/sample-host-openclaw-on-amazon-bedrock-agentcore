@@ -1,0 +1,19 @@
+sequenceDiagram
+    autonumber
+    actor User as Developer Browser
+    participant LocalVite as Local Vite/Express Backend
+    participant AgentCore as Bedrock AgentCore API
+    participant Contract as agentcore-contract.js ( microVM )
+    participant Gateway as OpenClaw Gateway (Port 18789)
+
+    User->>LocalVite: WebSocket Upgrade /ws
+    Note over LocalVite: Spawns Long-Polling Loop
+    loop Every 500ms (Fetch Dashboard Events)
+        LocalVite->>AgentCore: InvokeAgentRuntimeCommand (action: "dashboard_events")
+        AgentCore->>Contract: Decrypts and routes payload
+        Contract->>Gateway: Polls local telemetry buffer (ws://127.0.0.1:18789)
+        Gateway-->>Contract: Returns buffered agent state, log stream, animations
+        Contract-->>AgentCore: Returns events payload in JSON response
+        AgentCore-->>LocalVite: Standard HTTPS payload returned
+        LocalVite->>User: Decapsulates payload, pushes down WebSocket
+    end
