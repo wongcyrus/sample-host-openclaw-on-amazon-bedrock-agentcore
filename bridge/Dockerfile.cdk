@@ -16,7 +16,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     requests-auth-aws-sigv4
 
 # Install OpenClaw and ClawHub CLI globally
-RUN npm install -g openclaw@2026.5.19 clawhub@0.8.0
+RUN npm install -g openclaw@2026.6.11 clawhub@0.8.0
 
 # Install ClawHub community skills (5 high-value marketplace skills)
 RUN for skill in jina-reader deep-research-pro telegram-compose transcript task-decomposer; do \
