@@ -371,6 +371,30 @@ It also fails fast when `OPENCLAW_ENV_SUFFIX` / `environment_suffix` points at a
 
 Runtime settings are CDK-owned. In particular, `dashboard_api_push_url`, `humanoid_mcp_server_url`, `humanoid_mcp_auth_mode`, `humanoid_mcp_function_arn`, and `humanoid_mcp_api_key_header` should be set in `cdk.json` context rather than `.env*` files.
 
+### LiteLLM (optional)
+
+LiteLLM is configured directly in the selected deploy env file (`.env.dev` or `.env.prod`), not via Secrets Manager:
+
+```bash
+LITELLM_BASE_URL=https://your-litellm.example/v1
+LITELLM_API_KEY=your-key
+LITELLM_MODELS_JSON='[{"id":"kimi-k2.5","name":"kimi-k2.5"},{"id":"gpt-5.4-mini","name":"gpt-5.4-mini"}]'
+LITELLM_PRIMARY_MODEL_ID=kimi-k2.5
+LITELLM_SUBAGENT_MODEL_ID=gpt-5.4-mini
+```
+
+Reference project (endpoint + key source):
+
+- https://github.com/wongcyrus/litellm-aws-lambda-microvm-serverless
+- `LITELLM_BASE_URL` and `LITELLM_API_KEY` should be copied from that LiteLLM deployment.
+
+OpenClaw sends the same key in both headers when calling LiteLLM:
+
+- `Authorization: Bearer <apiKey>`
+- `x-api-key: <apiKey>`
+
+If the stored key already starts with `Bearer `, OpenClaw strips that prefix before sending `x-api-key` and re-adds it for `Authorization`.
+
 If you also set these Telegram values, deployment will bootstrap the bot automatically:
 
 ```bash

@@ -717,6 +717,148 @@ function getManagedAgentIds({ humanoidEnabled = false } = {}) {
   ];
 }
 
+function parseRequiredJsonEnv(value, label) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    throw new Error(`${label} is missing`);
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(`${label} must be valid JSON: ${err.message}`);
+  }
+}
+
+function normalizeModelCatalog(models, label) {
+  if (!Array.isArray(models) || models.length === 0) {
+    throw new Error(`${label} must be a non-empty JSON array`);
+  }
+
+  const seenIds = new Set();
+  return models.map((model, index) => {
+    if (!model || typeof model !== "object" || Array.isArray(model)) {
+      throw new Error(`${label}[${index}] must be an object`);
+    }
+    const id = String(model.id || "").trim();
+    const name = String(model.name || "").trim();
+    if (!id) {
+      throw new Error(`${label}[${index}].id is required`);
+    }
+    if (!name) {
+      throw new Error(`${label}[${index}].name is required`);
+    }
+    if (seenIds.has(id)) {
+      throw new Error(`${label} contains duplicate model id: ${id}`);
+    }
+    seenIds.add(id);
+    return {
+      ...model,
+      id,
+      name,
+    };
+  });
+}
+
+function buildAgentCoreProvider() {
+  return {
+    baseUrl: `http://127.0.0.1:${PROXY_PORT}/v1`,
+    apiKey: "local",
+    api: "openai-completions",
+    models: [
+      { id: "bedrock-agentcore", name: "Bedrock AgentCore" },
+      { id: SUBAGENT_MODEL_NAME, name: "Bedrock AgentCore Subagent" },
+    ],
+  };
+}
+
+function buildLiteLLMProviderConfig({ env = process.env } = {}) {
+  const baseUrl = String(env.LITELLM_BASE_URL || "").trim();
+  if (!baseUrl) {
+    return null;
+  }
+
+  const apiKey = String(env.LITELLM_API_KEY || "").trim();
+  const modelsJson = parseRequiredJsonEnv(
+    env.LITELLM_MODELS_JSON,
+    "LITELLM_MODELS_JSON",
+  );
+  const primaryModelId = String(env.LITELLM_PRIMARY_MODEL_ID || "").trim();
+  const subagentModelId = String(env.LITELLM_SUBAGENT_MODEL_ID || "").trim();
+
+  if (!apiKey) {
+    throw new Error("LITELLM_API_KEY is missing");
+  }
+  const normalizedApiKey = apiKey.replace(/^Bearer\s+/i, "").trim();
+  const authorizationHeader = `Bearer ${normalizedApiKey}`;
+  if (!primaryModelId) {
+    throw new Error("LITELLM_PRIMARY_MODEL_ID is missing");
+  }
+  if (!subagentModelId) {
+    throw new Error("LITELLM_SUBAGENT_MODEL_ID is missing");
+  }
+
+  const models = normalizeModelCatalog(modelsJson, "LITELLM_MODELS_JSON");
+  const modelIds = new Set(models.map((model) => model.id));
+  if (!modelIds.has(primaryModelId)) {
+    throw new Error(
+      `LITELLM_PRIMARY_MODEL_ID '${primaryModelId}' was not found in LITELLM_MODELS_JSON`,
+    );
+  }
+  if (!modelIds.has(subagentModelId)) {
+    throw new Error(
+      `LITELLM_SUBAGENT_MODEL_ID '${subagentModelId}' was not found in LITELLM_MODELS_JSON`,
+    );
+  }
+
+  const provider = {
+    baseUrl,
+    apiKey: normalizedApiKey,
+    api: "openai-completions",
+    headers: {
+      Authorization: authorizationHeader,
+      "x-api-key": normalizedApiKey,
+    },
+    models,
+  };
+
+  return {
+    activeProvider: "litellm",
+    providers: { litellm: provider },
+    primaryModelRef: `litellm/${primaryModelId}`,
+    subagentModelRef: `litellm/${subagentModelId}`,
+    providerModelCount: models.length,
+  };
+}
+
+function buildOpenClawModelConfig({
+  env = process.env,
+} = {}) {
+  const hasLiteLLM = String(env.LITELLM_BASE_URL || "").trim().length > 0;
+  if (!hasLiteLLM) {
+    return {
+      activeProvider: "agentcore",
+      providers: { agentcore: buildAgentCoreProvider() },
+      primaryModelRef: PRIMARY_MODEL,
+      subagentModelRef: `agentcore/${SUBAGENT_MODEL_NAME}`,
+      providerModelCount: 2,
+    };
+  }
+
+  return buildLiteLLMProviderConfig({ env });
+}
+
+function logOpenClawModelConfig(config) {
+  const providerNames = Object.keys(config.providers || {});
+  console.log(
+    `[contract] OpenClaw model config: provider=${config.activeProvider} primary=${config.primaryModelRef} subagent=${config.subagentModelRef}`,
+  );
+  console.log(
+    `[contract] OpenClaw providers=${providerNames.join(",")} modelCounts=${providerNames
+      .map((name) => `${name}:${config.providers[name].models.length}`)
+      .join(",")}`,
+  );
+}
+
 /**
  * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
  * Full tool profile with deny list for unsafe/irrelevant tools.
@@ -725,9 +867,6 @@ function getManagedAgentIds({ humanoidEnabled = false } = {}) {
  */
 function writeOpenClawConfig() {
   const homeDir = process.env.HOME || "/root";
-  // Sub-agent model uses a distinct name so the proxy can identify subagent requests.
-  // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
-  const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
   const humanoidMcpUrl = (process.env.HUMANOID_MCP_SERVER_URL || "").trim();
   const humanoidAuthMode = (process.env.HUMANOID_MCP_AUTH_MODE || "iam").trim().toLowerCase();
   const humanoidApiKeyHeader = (process.env.HUMANOID_MCP_API_KEY_HEADER || "x-api-key").trim();
@@ -737,10 +876,12 @@ function writeOpenClawConfig() {
   const digitalHumanApiKeyHeader = humanoidApiKeyHeader;
   const mainWorkspaceDir = buildAgentWorkspaceDir(homeDir, MAIN_AGENT_ID);
   const managedAgentIds = getManagedAgentIds({ humanoidEnabled });
+  const modelConfig = buildOpenClawModelConfig();
+  logOpenClawModelConfig(modelConfig);
   const mainAgent = {
     id: "main",
     name: "Main",
-    model: PRIMARY_MODEL,
+    model: modelConfig.primaryModelRef,
     identity: { name: "Main" },
     workspace: mainWorkspaceDir,
   };
@@ -752,7 +893,7 @@ function writeOpenClawConfig() {
   const domainCommentatorAgent = {
     id: DOMAIN_COMMENTATOR_AGENT_ID,
     name: "Domain Arena Commentator",
-    model: subagentModel,
+    model: modelConfig.subagentModelRef,
     identity: { name: "Domain Arena Commentator" },
     workspace: buildAgentWorkspaceDir(homeDir, DOMAIN_COMMENTATOR_AGENT_ID),
     tools: {
@@ -777,7 +918,7 @@ function writeOpenClawConfig() {
   const communicationManagerAgent = {
     id: COMMUNICATION_MANAGER_AGENT_ID,
     name: "communication-manager",
-    model: subagentModel,
+    model: modelConfig.subagentModelRef,
     skills: ["digital_human"],
     identity: { name: "communication-manager" },
     workspace: buildAgentWorkspaceDir(homeDir, COMMUNICATION_MANAGER_AGENT_ID),
@@ -800,7 +941,7 @@ function writeOpenClawConfig() {
     ? HUMANOID_ROBOT_IDS.map((robotId, index) => ({
       id: robotId,
       name: `Robot ${index + 1}`,
-      model: subagentModel,
+      model: modelConfig.subagentModelRef,
       skills: ["humanoid"],
       identity: { name: `Robot ${index + 1}` },
       workspace: buildAgentWorkspaceDir(homeDir, robotId),
@@ -829,24 +970,14 @@ function writeOpenClawConfig() {
 
   const config = {
     models: {
-      providers: {
-        agentcore: {
-          baseUrl: `http://127.0.0.1:${PROXY_PORT}/v1`,
-          apiKey: "local",
-          api: "openai-completions",
-          models: [
-            { id: "bedrock-agentcore", name: "Bedrock AgentCore" },
-            { id: SUBAGENT_MODEL_NAME, name: "Bedrock AgentCore Subagent" },
-          ],
-        },
-      },
+      providers: modelConfig.providers,
     },
     agents: {
       defaults: {
-        model: { primary: PRIMARY_MODEL },
+        model: { primary: modelConfig.primaryModelRef },
         workspace: mainWorkspaceDir,
         subagents: {
-          model: subagentModel,
+          model: modelConfig.subagentModelRef,
           maxConcurrent: 2,
           runTimeoutSeconds: 900,
           archiveAfterMinutes: 60,
@@ -2748,5 +2879,9 @@ if (process.env.NODE_ENV !== "test") {
     bridgeMessage,
     processMessageQueue,
     buildBridgeText,
+    buildOpenClawModelConfig,
+    buildLiteLLMProviderConfig,
+    buildAgentCoreProvider,
+    normalizeModelCatalog,
   };
 }

@@ -572,6 +572,21 @@ class AgentCoreStack(Stack):
                 self.node.try_get_context("dashboard_api_push_url") or ""
             ).strip(),
         }
+        litellm_base_url = str(os.environ.get("LITELLM_BASE_URL") or "").strip()
+        litellm_api_key = str(os.environ.get("LITELLM_API_KEY") or "").strip()
+        litellm_models_json = str(os.environ.get("LITELLM_MODELS_JSON") or "").strip()
+        litellm_primary_model_id = str(os.environ.get("LITELLM_PRIMARY_MODEL_ID") or "").strip()
+        litellm_subagent_model_id = str(os.environ.get("LITELLM_SUBAGENT_MODEL_ID") or "").strip()
+        if litellm_base_url:
+            runtime_env["LITELLM_BASE_URL"] = litellm_base_url
+        if litellm_api_key:
+            runtime_env["LITELLM_API_KEY"] = litellm_api_key
+        if litellm_models_json:
+            runtime_env["LITELLM_MODELS_JSON"] = litellm_models_json
+        if litellm_primary_model_id:
+            runtime_env["LITELLM_PRIMARY_MODEL_ID"] = litellm_primary_model_id
+        if litellm_subagent_model_id:
+            runtime_env["LITELLM_SUBAGENT_MODEL_ID"] = litellm_subagent_model_id
         humanoid_mcp_url = str(
             self.node.try_get_context("humanoid_mcp_server_url") or ""
         ).strip()
