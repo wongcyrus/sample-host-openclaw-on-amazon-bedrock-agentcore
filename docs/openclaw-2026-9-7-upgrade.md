@@ -290,7 +290,31 @@ synthesis. IAM simulation allowed the new grant through DynamoDB and rejected
 its use through Secrets Manager. The targeted security review found no issues.
 These checks do not substitute for a live scheduling operation after deployment.
 
-This KMS fix is not deployed. The scoped deployment diff also includes the
-previously committed response-log privacy remediation (runtime image and
-Router/cron Lambda code), so applying it is not an IAM-only rollout. There are
-no table, key, or networking changes in that diff.
+### Dev rollout verification
+
+The fix was deployed to `OpenClawAgentCore-dev`, `OpenClawRouter-dev`, and
+`OpenClawCron-dev`, reaching runtime version **13** with the DEFAULT endpoint
+ready. The rollout also applied the previously committed response-log privacy
+remediation (runtime image and Router/cron Lambda code). Existing PUBLIC
+networking and Browser-disabled configuration were preserved; production,
+tables, and keys were not replaced.
+
+Verification passed 68 targeted Python regressions and seven live webhook,
+message-lifecycle, and Telegram-formatting tests. A separate live scheduling
+journey used the runtime's actual tools to create an exact-name, far-future
+schedule, persist its CRON record, list it, and delete both resources. Directly
+invoking the cron Lambda with that schedule's target payload also passed the
+ownership check, invoked the runtime, and completed channel delivery without
+logged delivery errors. This verifies the executor, but not an automatic
+EventBridge trigger at the scheduled time. Test resources were removed.
+
+Post-rollout Router, cron, and runtime logs contained no KMS denials or error
+lines in the verification window. Router logged eight Telegram delivery
+acknowledgements; cron logged one completed execution. Raw response previews
+were absent. No configured LiteLLM API key was observed in those logs.
+
+**Remaining logging caveat:** OpenClaw's own `provider-transport-fetch` messages
+still log the configured LiteLLM endpoint URL in the access-controlled runtime
+CloudWatch log. The Router/cron response-preview fix does not redact these
+upstream transport messages. The actual endpoint and API key are not included
+in this documentation or committed configuration.
