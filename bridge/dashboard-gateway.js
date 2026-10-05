@@ -58,10 +58,9 @@ async function fetchGatewaySnapshot({
 } = {}) {
   const WebSocketImpl = wsImpl || require("ws");
   const wsUrl = `ws://127.0.0.1:${port}`;
-  const httpOrigin = `http://127.0.0.1:${port}`;
 
   return new Promise((resolve, reject) => {
-    const ws = new WebSocketImpl(wsUrl, { origin: httpOrigin });
+    const ws = new WebSocketImpl(wsUrl);
     let settled = false;
     let closingIntentional = false;
     let requestSeq = 1;
@@ -131,7 +130,7 @@ async function fetchGatewaySnapshot({
               minProtocol: protocolVersion,
               maxProtocol: protocolVersion,
               client: {
-                id: "openclaw-control-ui",
+                id: "gateway-client",
                 version: "agentcore-dashboard-bridge",
                 platform: "linux",
                 mode: "backend",
@@ -273,7 +272,6 @@ function streamGatewayEvents({
 } = {}) {
   const WebSocketImpl = wsImpl || require("ws");
   const wsUrl = `ws://127.0.0.1:${port}`;
-  const httpOrigin = `http://127.0.0.1:${port}`;
   const runRoles = new Map();
 
   let ws = null;
@@ -292,7 +290,7 @@ function streamGatewayEvents({
 
   const open = (activeProtocolVersion, canFallback) => {
     if (stopped) return;
-    ws = new WebSocketImpl(wsUrl, { origin: httpOrigin });
+    ws = new WebSocketImpl(wsUrl);
     intentionalClose = false;
     connectReqId = null;
 
@@ -315,7 +313,7 @@ function streamGatewayEvents({
               minProtocol: activeProtocolVersion,
               maxProtocol: activeProtocolVersion,
               client: {
-                id: "openclaw-control-ui",
+                id: "gateway-client",
                 version: "agentcore-dashboard-bridge",
                 platform: "linux",
                 mode: "backend",

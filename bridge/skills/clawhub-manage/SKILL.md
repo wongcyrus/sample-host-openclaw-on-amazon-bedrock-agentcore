@@ -50,4 +50,4 @@ node {baseDir}/list.js
 
 - After install/uninstall, the skill will be loaded/unloaded on the next session start (after idle timeout or new conversation) (web search, file storage, scheduling)
 - Only valid ClawHub skill names are accepted (letters, numbers, hyphens)
-- Pre-installed skills: jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer
+- Pre-installed skills: jina-reader, telegram-compose

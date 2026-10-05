@@ -96,7 +96,7 @@ sequenceDiagram
         AC->>AC: STS AssumeRole (scoped S3 creds)
         AC->>AC: Prepare session storage-backed ~/.openclaw
         AC->>AC: Start proxy (~5s)
-        AC->>S3: Restore .openclaw/ when session storage empty/unavailable
+        AC->>S3: Await committed snapshot restore when session storage empty/unavailable
         AC->>S3: Sync managed workspace files (user namespace, then bootstrap)
         AC->>AC: Start OpenClaw with scoped creds (background, ~1-2 min)
     end
@@ -218,7 +218,7 @@ flowchart TB
         end
 
         subgraph FullBox["Full Mode (~1-2min onward)"]
-            OPENCLAW["<b>OpenClaw Gateway :18789</b><br/>Headless mode · Full tool profile<br/>5 ClawHub skills · Sub-agents"]
+            OPENCLAW["<b>OpenClaw Gateway :18789</b><br/>Headless mode · Full tool profile<br/>2 ClawHub skills · Sub-agents"]
         end
 
         PROXY["<b>Bedrock Proxy :18790</b><br/>OpenAI compat → ConverseStream<br/>Cognito identity · Multimodal images"]
@@ -230,7 +230,7 @@ flowchart TB
     PROXY -->|ConverseStream| BEDROCK["Amazon Bedrock<br/>Claude"]
 
     S3[("S3<br/>workspace · files · images")]
-    CONTRACT <-->|"restore / save<br/>.openclaw/"| S3
+    CONTRACT <-->|"verify / publish<br/>SQLite snapshots + manifest"| S3
     CONTRACT -->|"managed workspace<br/><namespace> then workspace-bootstrap"| S3
     SHIM -.->|"execFile<br/>skill scripts"| S3
 ```
@@ -286,6 +286,13 @@ flowchart LR
 
 ### Two-Phase Startup
 
+Restore and any required offline database migration finish before gateway
+startup. The timeline below illustrates a short preparation phase; restored
+users can take longer. The lightweight agent is not available until initialization
+returns with the proxy ready. See the
+[2026.9.7 upgrade record](openclaw-2026-9-7-upgrade.md) for migration and restore
+failure handling.
+
 ```mermaid
 gantt
     title Cold Start Timeline
@@ -311,7 +318,7 @@ gantt
 
 **Warm-up phase** (t=~5s to ~1-2min): Lightweight agent responds with 17 tools (web_fetch, web_search, 4 file, 4 cron, 3 skill management, 4 API key tools). All responses include `"_Warm-up mode — after full startup..._"` footer.
 
-**Full mode** (t=~1-2min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
+**Full mode** (t=~1-2min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (jina-reader, telegram-compose); built-in sub-agent delegation remains available.
 
 ### Lightweight Agent Architecture
 
@@ -334,11 +341,13 @@ The lightweight agent (`bridge/lightweight-agent.js`) provides immediate respons
 ```
 s3://openclaw-user-files-{account}-{region}/
 ├── telegram_123456789/           # User namespace (channel_id)
-│   ├── .openclaw/                 # Workspace (synced on init/shutdown)
-│   │   ├── openclaw.json
+│   ├── .openclaw/                 # Legacy backup; fallback without a manifest
 │   │   ├── MEMORY.md
 │   │   ├── USER.md
 │   │   └── ...
+│   ├── .openclaw-snapshots/       # Immutable SQLite-aware backup generations
+│   │   ├── latest.json           # Committed sizes/checksums manifest
+│   │   └── {generation}/         # Verified files; no live SQLite sidecars
 │   ├── _uploads/                  # Image uploads (from Router Lambda)
 │   │   ├── img_1709012345_a1b2.jpeg
 │   │   └── ...

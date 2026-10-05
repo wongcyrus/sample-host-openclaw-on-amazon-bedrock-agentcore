@@ -102,7 +102,7 @@
 |  |  +------v-----------+               +---------v----------+                              |
 |  |  | Amazon Bedrock   |               | S3 User Files      |                              |
 |  |  | ConverseStream   |               | Bucket             |                              |
-|  |  | API              |               | - {ns}/.openclaw/  |                              |
+|  |  | API              |               | - snapshots + manifest |                         |
 |  |  | MiniMax M2.1     |               | - {ns}/files/      |                              |
 |  |  +------------------+               +--------------------+                              |
 |  |                                                                                         |
@@ -140,19 +140,21 @@
          |
          v
   First /invocations {action: "chat"}:
-    1. Prepare session storage-backed ~/.openclaw (or fall back to S3 primary sync)
-    2. Restore .openclaw/ from S3 only when session storage is empty/unavailable
-    3. Sync managed workspace files from S3 (`<namespace>/...`, fallback `workspace-bootstrap/...`)
-    4. Start agentcore-proxy.js (port 18790) with USER_ID env
-    5. Write headless OpenClaw config (no channels)
-    6. Start OpenClaw gateway (port 18789, ~1-2 min startup)
-    7. Start periodic workspace saves (every 5 min; 30 min in backup mode)
+    1. Start agentcore-proxy.js (port 18790) with USER_ID env
+    2. Prepare real ~/.openclaw and recover interrupted snapshot publication
+    3. Await committed S3 restore when session storage is empty/unavailable
+    4. Sync managed workspace files (`<namespace>/...`, fallback `workspace-bootstrap/...`)
+    5. Write headless config; run offline Doctor migration for restored agent databases
+    6. Reapply generated config and save migrated state before gateway startup
+    7. Start OpenClaw gateway (port 18789); shim handles chat while gateway loads
+    8. Start periodic workspace saves once the gateway is ready
          |
          v
   WebSocket bridge: auth -> chat.send -> streaming deltas -> final
          |
          v
-  Router Lambda sends response to Telegram via sendMessage API
+  Contract sends Telegram reply when streaming is enabled;
+  Router Lambda sends it otherwise (avoids duplicate delivery)
          |
          v
   (Subsequent messages reuse the warm microVM — fast response)
@@ -161,7 +163,7 @@
          |
          v
   AgentCore sends SIGTERM:
-    1. Save .openclaw/ to S3  (final workspace save)
+    1. Stop OpenClaw, then publish SQLite-aware session/S3 snapshots
     2. Kill child processes
     3. Exit
          |
@@ -173,7 +175,7 @@
 
 ```
 +-----------------------------------------------------------------------+
-|  AgentCore Runtime Container (node:22-slim, ARM64, per-user)          |
+|  AgentCore Runtime Container (Node 24.16.0, ARM64, per-user)          |
 |                                                                       |
 |  entrypoint.sh starts contract server immediately:                    |
 |                                                                       |
@@ -197,7 +199,7 @@
 |    |   connect -> auth(token) -> chat.send -> deltas -> final        |
 |    |                                                                  |
 |    |-- On SIGTERM:                                                   |
-|        Save .openclaw/ to S3 -> kill children -> exit                |
+|        Stop OpenClaw -> snapshot state -> stop proxy -> exit       |
 |                                                                       |
 |  agentcore-proxy.js (port 18790)                                      |
 |    |-- POST /v1/chat/completions -> Bedrock ConverseStream            |

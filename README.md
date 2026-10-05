@@ -425,6 +425,69 @@ The deploy script runs three phases automatically:
 
 The script runs pre-flight checks (AWS credentials, CDK CLI, Python venv bootstrap, Docker when needed, and required deployment setting validation) before starting.
 
+**OpenClaw 2026.9.7 upgrade:** both container build paths pin Node.js
+`24.16.0-bookworm-slim` and OpenClaw `2026.9.7`. The contract generates
+`agents.entries` with explicit ownership while preserving Lambda channel routing,
+per-user microVMs, and both AgentCore and LiteLLM model providers. No shared EFS
+or PostgreSQL backend is introduced.
+See [the upgrade record](docs/openclaw-2026-9-7-upgrade.md) for the dev deployment,
+live failures and fixes, validation results, and rollback requirements.
+The chat and dashboard bridges authenticate as loopback `gateway-client` backends
+without browser Origin headers; Control UI is disabled. Built-in cron is disabled
+explicitly so EventBridge remains the scheduler.
+
+Container builds fail if any required ClawHub skill cannot be installed after
+retries. If ClawHub reports an ambiguous slug, resolve it to the intended
+publisher-qualified reference in both Dockerfiles before deployment; do not
+silently omit it or select an arbitrary publisher.
+
+Workspace backups now snapshot each SQLite database using Node's SQLite online
+backup API and check integrity before publishing. This uses the same SQLite
+engine as OpenClaw, including functions required by its current schema, rather
+than the older system Python SQLite. S3 generations live under
+`{namespace}/.openclaw-snapshots/{generation}/`; `latest.json` is committed only
+after every included file uploads. Restore verifies file sizes and SHA-256 hashes
+and completes before gateway startup. Existing `{namespace}/.openclaw/` backups
+remain readable when no new manifest exists. SQLite databases are exempt from the
+ordinary 10 MB file limit. Generations remain subject to the bucket's retention
+policy, so monitor storage growth.
+
+Restored agent databases run OpenClaw's offline
+`doctor --fix --non-interactive` persisted-media migration before the new gateway
+starts. Migration failures block startup. The contract reapplies its generated
+configuration and publishes a completed backup before starting the gateway.
+A working warm-up shim alone is not sufficient to validate an upgrade.
+
+Session storage keeps a staged replacement and the previous completed directory;
+it does not delete the last good copy before preparing the next one. On shutdown,
+the contract waits for OpenClaw to stop before its final backup. A shutdown that
+exceeds the grace period recovers from the last completed periodic snapshot.
+If the filesystem cannot rename the workspace root, publication retains that
+root and uses an interruption journal plus the previous copy; startup recovers
+an interrupted replacement before allowing the gateway to run.
+Online snapshots are consistent **per database**, not a single transaction across
+all databases and workspace files. Stop the gateway for a quiesced pre-deployment
+backup when cross-database consistency is required.
+
+Before production rollout, canary the ARM64 image with both fresh and restored
+users, real gateway chat/delegation/dashboard events, and SQLite integrity checks
+after stop/resume and runtime image replacement. `/ping` and lightweight-shim
+responses alone do not prove the upgrade. Retain the old image **and pre-upgrade
+state** for rollback; older OpenClaw versions do not read the new backup manifest
+and may not understand migrated SQLite schemas. Deploy through CDK's runtime phase
+only after these checks pass, then stop old sessions so requests reach the new image.
+
+Run the opt-in real-package compatibility check with Node 24.16.0 or another
+supported version:
+
+```bash
+OPENCLAW_COMPAT_BINARY="$(command -v openclaw)" node --test bridge/openclaw-compat.test.js
+```
+
+It validates both generated provider configurations and checks real gateway
+authentication, dashboard agent/session reads, and chat against a local mock model
+endpoint. It does not replace deployed AWS/channel E2E tests.
+
 **Bedrock invocation logging is shared per AWS account + region.** It is not isolated by `OPENCLAW_ENV_SUFFIX`. Because of that, exactly one environment in a given account+region should own the Bedrock invocation logging configuration and the CloudWatch Logs subscription filter. Configure that explicitly with:
 
 ```bash
@@ -560,7 +623,7 @@ openclaw-on-agentcore/
     guardrails_stack.py           # Bedrock Guardrails (content filters, PII, topic denial)
     cron_stack.py                 # EventBridge Scheduler, Cron executor Lambda, IAM
   bridge/
-    Dockerfile                    # Container image (node:22-slim, ARM64, clawhub skills)
+    Dockerfile                    # Container image (Node 24.16.0, OpenClaw 2026.9.7, ARM64)
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
     lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron + clawhub-manage tools)
@@ -815,7 +878,7 @@ Each user gets their own AgentCore microVM. When a user sends a message:
    - Starts credential refresh timer (45 min interval)
    - Waits for proxy only (~5s), then the **lightweight agent** handles the message immediately
 3. **Lightweight agent** (warm-up phase, ~5s to ~1-2min) runs an agentic loop with 17 tools: `web_fetch`, `web_search`, S3 file storage (read/write/list/delete), EventBridge cron scheduling (create/list/update/delete), ClawHub skill management (install/uninstall/list), and API key management (native CRUD, Secrets Manager CRUD, unified retrieval, migration). Web tools include SSRF prevention (IP blocklists, DNS rebinding mitigation). All responses include a deterministic warm-up footer
-4. **WebSocket bridge** (after OpenClaw ready, ~1-2min) takes over — messages route to OpenClaw which provides full tool profile, 5 ClawHub skills, and sub-agent support. Responses no longer have the warm-up footer
+4. **WebSocket bridge** (after OpenClaw ready, ~1-2min) takes over — messages route to OpenClaw which provides full tool profile, 2 ClawHub skills, and built-in sub-agent support. Responses no longer have the warm-up footer
 5. **Router Lambda** sends the response back to the channel (Telegram/Slack API). While waiting, it sends typing indicators (Telegram) and a one-time progress message after 30s (both channels) for long-running requests
 
 When the session idles (default 30 min), AgentCore terminates the microVM. Before shutdown, the SIGTERM handler saves `.openclaw/` to S3. The next message creates a fresh microVM and restores the workspace.
@@ -977,7 +1040,7 @@ Screenshots are uploaded to `{namespace}/_screenshots/` in S3 and delivered as p
    - Wait for proxy only (~5s)
 5. **Warm-up phase** (t=~10s to ~1-2min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, and clawhub-manage tools — users can manage files, schedules, and install skills immediately)
 6. **Handoff** (~1-2min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
-7. **After handoff**: Full OpenClaw features — built-in web tools (`web_search`, `web_fetch`), 5 ClawHub skills (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer), sub-agent support, session management
+7. **After handoff**: Full OpenClaw features — built-in web tools (`web_search`, `web_fetch`), 2 ClawHub skills (jina-reader, telegram-compose), built-in sub-agent support, session management
 8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ### Message Flow
@@ -1005,15 +1068,12 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `agentcore-browser` | Headless Chromium browser — navigate, screenshot, interact with web pages (optional, see [Browser Support](#browser-support-optional)) |
 | `digital_human` | MCP-backed presenter speech skill for the `domain-commentator` agent |
 
-Five ClawHub community skills are pre-installed at Docker build time:
+Two ClawHub community skills are pre-installed at Docker build time:
 
 | ClawHub Skill | Purpose |
 |---|---|
 | `jina-reader` | Extract web content as clean markdown |
-| `deep-research-pro` | In-depth multi-step research (spawns sub-agents) |
 | `telegram-compose` | Rich HTML formatting for Telegram messages |
-| `transcript` | YouTube video transcript extraction |
-| `task-decomposer` | Break complex requests into subtasks (spawns sub-agents) |
 
 During the warm-up phase (~first 1-2 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files`, `eventbridge-cron`, `clawhub-manage`, and `api-keys` skills. Users can manage files, schedules, skills, and API keys even during warm-up. ClawHub skills become available after OpenClaw fully starts.
 
@@ -1179,7 +1239,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
 - **Cognito passwords**: HMAC-derived (`HMAC-SHA256(secret, actorId)`) — deterministic, never stored. Enables `AdminInitiateAuth` without per-user password storage.
 - **`skills.allowBundled` is an array**: OpenClaw expects `["*"]` (not `true`) — boolean causes config validation failure.
-- **ClawHub skills**: 5 community skills are pre-installed at Docker build time (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer). Custom skills (s3-user-files, eventbridge-cron, clawhub-manage) are in `/skills/` loaded via `extraDirs`. ClawHub installs to the managed skills path, scanned automatically by OpenClaw. Users can install/uninstall skills via the `clawhub-manage` skill — changes take effect on the next session start.
+- **ClawHub skills**: 2 community skills are pre-installed at Docker build time (jina-reader, telegram-compose). Custom skills (s3-user-files, eventbridge-cron, clawhub-manage) are in `/skills/` loaded via `extraDirs`. ClawHub installs to the managed skills path, scanned automatically by OpenClaw. Users can install/uninstall skills via the `clawhub-manage` skill — changes take effect on the next session start.
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **`default-user` fallback**: If identity resolution fails, requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. The `USER_ID` env var path (set by contract server) should prevent this in per-user mode.
 - **actorId vs namespace format**: The actorId uses colon format (`telegram:123456789`) while skill scripts expect namespace/underscore format (`telegram_123456789`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.

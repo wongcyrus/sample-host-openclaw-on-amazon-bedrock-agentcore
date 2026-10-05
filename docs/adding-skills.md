@@ -19,18 +19,20 @@ The agent will execute the installation script, and the skill will be available 
 ### For all users (Baked into the container)
 If you want a community skill to be permanently available for all users on startup, you must add it to the container image build process.
 
-1. Open `bridge/Dockerfile.cdk`.
+1. Open both `bridge/Dockerfile.cdk` and `bridge/Dockerfile`.
 2. Locate the ClawHub install loop (around line 22).
 3. Add the skill name to the `for skill in ...` list:
 
 ```dockerfile
 # Install ClawHub community skills
-RUN for skill in jina-reader deep-research-pro telegram-compose transcript task-decomposer YOUR_NEW_SKILL_HERE; do \
+RUN for skill in jina-reader telegram-compose YOUR_NEW_SKILL_HERE; do \
+      installed=0; \
       for attempt in 1 2 3 4 5; do \
-        clawhub install "$skill" --no-input --force && break; \
+        if clawhub install "$skill" --no-input --force; then installed=1; break; fi; \
         echo "Retry $attempt for $skill (waiting 15s)..."; \
         sleep 15; \
       done; \
+      if [ "$installed" -ne 1 ]; then echo "Required ClawHub skill failed: $skill" >&2; exit 1; fi; \
     done
 ```
 

@@ -46,8 +46,8 @@ const SYSTEM_PROMPT =
   "or manage_secret (AWS Secrets Manager, more secure). Recommend manage_secret for " +
   "production keys. Use retrieve_api_key to look up keys from either backend.\n\n" +
   "After full startup completes (~1-2 minutes), you gain additional capabilities: " +
-  "deep research (multi-step analysis), YouTube transcripts, rich Telegram formatting, " +
-  "task decomposition with sub-agents, and enhanced web reading via Jina. " +
+  "rich Telegram formatting, " +
+  "built-in sub-agent delegation, and enhanced web reading via Jina. " +
   "Do not use markdown tables in responses — use bullet lists or plain paragraphs, as they render better in chat interfaces like Telegram and Slack.";
 
 const TOOLS = [
@@ -1421,8 +1421,8 @@ async function chat(userMessage, userId, deadlineMs = 0) {
       const footer =
         "\n\n---\n" +
         "_Warm-up mode — after full startup (~5-6 second), additional " +
-        "community skills come online: YouTube transcripts, deep research, " +
-        "task decomposition with sub-agents, etc._";
+        "community skills come online: enhanced web reading, rich Telegram formatting, " +
+        "etc. Built-in sub-agent delegation also becomes available._";
       return text + footer;
     }
 
@@ -1455,8 +1455,8 @@ async function chat(userMessage, userId, deadlineMs = 0) {
   const fallbackFooter =
     "\n\n---\n" +
     "_Warm-up mode — after full startup (~5-6 second), additional " +
-    "community skills come online: YouTube transcripts, deep research, " +
-    "task decomposition with sub-agents, etc._";
+    "community skills come online: enhanced web reading, rich Telegram formatting, " +
+    "etc. Built-in sub-agent delegation also becomes available._";
   return "I ran into a limit processing your request. Please try rephrasing." + fallbackFooter;
 }
 

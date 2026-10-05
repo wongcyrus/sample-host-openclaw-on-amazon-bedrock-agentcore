@@ -35,6 +35,8 @@ class MockWebSocket extends EventEmitter {
     const msg = JSON.parse(payload);
 
     if (msg.method === "connect") {
+      assert.equal(msg.params.client.id, "gateway-client");
+      assert.equal(msg.params.client.mode, "backend");
       this.protocolVersion = msg.params.maxProtocol;
       if (this.protocolVersion !== MockWebSocket.acceptedProtocol) {
         process.nextTick(() => {
@@ -107,7 +109,7 @@ describe("fetchGatewaySnapshot", () => {
     });
 
     assert.equal(MockWebSocket.instances.length, 1);
-    assert.equal(MockWebSocket.instances[0].options.origin, "http://127.0.0.1:18789");
+    assert.equal(MockWebSocket.instances[0].options?.origin, undefined);
     assert.equal(MockWebSocket.instances[0].protocolVersion, 4);
     assert.deepStrictEqual(snapshot.agents.agents.map((agent) => agent.id), [
       "agent-1",
@@ -163,6 +165,8 @@ class StreamingMockWebSocket extends EventEmitter {
   send(payload, cb) {
     const msg = JSON.parse(payload);
     if (msg.method === "connect") {
+      assert.equal(msg.params.client.id, "gateway-client");
+      assert.equal(msg.params.client.mode, "backend");
       this.protocolVersion = msg.params.maxProtocol;
       if (this.protocolVersion !== StreamingMockWebSocket.acceptedProtocol) {
         process.nextTick(() => {

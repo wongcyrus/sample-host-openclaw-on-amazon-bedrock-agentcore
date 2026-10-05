@@ -7,8 +7,8 @@
  *
  * Each AgentCore session is dedicated to a single user. On first invocation:
  *   1. Use pre-fetched secrets (fetched eagerly at boot)
- *   2. Start proxy + OpenClaw + workspace restore in parallel
- *   3. Once proxy is ready (~5s), route via lightweight agent shim
+ *   2. Start proxy; restore and migrate workspace before starting OpenClaw
+ *   3. Once initialization returns with proxy ready, route via lightweight agent shim
  *   4. Once OpenClaw is ready (~1-2 min), route via WebSocket bridge
  *
  * The lightweight agent handles messages immediately while OpenClaw starts.
@@ -20,13 +20,21 @@
 const http = require("http");
 const https = require("https");
 const fs = require("fs");
-const { spawn } = require("child_process");
+const { spawn, execFile } = require("child_process");
+const { promisify } = require("util");
+const runFile = promisify(execFile);
 const WebSocket = require("ws");
 const {
   SecretsManagerClient,
   GetSecretValueCommand,
 } = require("@aws-sdk/client-secrets-manager");
 const workspaceSync = require("./workspace-sync");
+const {
+  createWorkspaceSnapshot,
+  publishDirectorySnapshot,
+  recoverDirectorySnapshot,
+  listFiles,
+} = require("./workspace-snapshot");
 const cwLogger = require("./cloudwatch-logger");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
@@ -312,18 +320,22 @@ function copyDirectoryContents(srcDir, dstDir) {
   }
 }
 
-function syncWorkspaceToSessionStorage() {
+let sessionSnapshotPromise = null;
+async function syncWorkspaceToSessionStorage() {
   if (!currentSessionStorageDir) {
     return;
   }
-  try {
-    fs.mkdirSync(currentSessionStorageDir, { recursive: true });
-    clearDirectoryContents(currentSessionStorageDir);
-    copyDirectoryContents(OPENCLAW_DIR, currentSessionStorageDir);
+  if (sessionSnapshotPromise) return sessionSnapshotPromise;
+  sessionSnapshotPromise = (async () => {
+    const snapshot = await createWorkspaceSnapshot(OPENCLAW_DIR);
+    try {
+      publishDirectorySnapshot(snapshot.path, currentSessionStorageDir);
+    } finally {
+      snapshot.cleanup();
+    }
     console.log(`[contract] Session storage synced from ${OPENCLAW_DIR} to ${currentSessionStorageDir}`);
-  } catch (err) {
-    console.warn(`[contract] Session storage sync failed: ${err.message}`);
-  }
+  })().finally(() => { sessionSnapshotPromise = null; });
+  return sessionSnapshotPromise;
 }
 
 function startSessionStorageSync() {
@@ -335,7 +347,9 @@ function startSessionStorageSync() {
     clearInterval(sessionStorageSyncTimer);
   }
   sessionStorageSyncTimer = setInterval(() => {
-    syncWorkspaceToSessionStorage();
+    syncWorkspaceToSessionStorage().catch((err) => {
+      console.error(`[contract] Keeping previous session snapshot: ${err.message}`);
+    });
   }, interval);
   console.log(`[contract] Session storage sync started (every ${interval / 1000}s)`);
 }
@@ -358,10 +372,12 @@ function prepareSessionStorageWorkspace() {
         existingType = "file";
         fs.unlinkSync(OPENCLAW_DIR);
       }
-    } catch {
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
       // OPENCLAW_DIR doesn't exist yet — that's fine
     }
     fs.mkdirSync(OPENCLAW_DIR, { recursive: true });
+    recoverDirectorySnapshot(OPENCLAW_DIR);
 
     // Check if session storage mount exists (only available during invocation)
     if (!fs.existsSync(SESSION_STORAGE_MOUNT)) {
@@ -371,15 +387,11 @@ function prepareSessionStorageWorkspace() {
     }
 
     const mountedDir = `${SESSION_STORAGE_MOUNT}/.openclaw`;
+    recoverDirectorySnapshot(mountedDir);
     fs.mkdirSync(mountedDir, { recursive: true });
     currentSessionStorageDir = mountedDir;
 
-    let hasContent = false;
-    try {
-      hasContent = fs.readdirSync(mountedDir).length > 0;
-    } catch {
-      hasContent = false;
-    }
+    const hasContent = fs.readdirSync(mountedDir).length > 0;
 
     if (hasContent) {
       clearDirectoryContents(OPENCLAW_DIR);
@@ -397,7 +409,7 @@ function prepareSessionStorageWorkspace() {
   } catch (err) {
     console.warn(`[contract] Session storage setup failed: ${err.message}`);
     currentSessionStorageDir = null;
-    return { available: false, mountedDir: null, hasContent: false };
+    throw new Error(`Workspace/session storage preparation failed: ${err.message}`, { cause: err });
   }
 }
 
@@ -862,10 +874,10 @@ function logOpenClawModelConfig(config) {
 /**
  * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
  * Full tool profile with deny list for unsafe/irrelevant tools.
- * Sub-agents enabled for deep-research-pro and task-decomposer skills.
+ * Built-in sub-agent delegation remains enabled.
  * Sandbox disabled — AgentCore microVMs provide per-user isolation.
  */
-function writeOpenClawConfig() {
+function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
   const homeDir = process.env.HOME || "/root";
   const humanoidMcpUrl = (process.env.HUMANOID_MCP_SERVER_URL || "").trim();
   const humanoidAuthMode = (process.env.HUMANOID_MCP_AUTH_MODE || "iam").trim().toLowerCase();
@@ -949,7 +961,7 @@ function writeOpenClawConfig() {
         profile: "full",
         deny: [
           "tts",
-          "image",
+          "view_image",
           "image_generate",
           "music_generate",
           "video_generate",
@@ -957,12 +969,12 @@ function writeOpenClawConfig() {
           "canvas",
           "web_search",
           "web_fetch",
+          "x_search",
           "subagents",
         ],
         exec: {
           host: "gateway",
-          security: "full",
-          ask: "off",
+          mode: "full",
         },
       },
     }))
@@ -973,8 +985,16 @@ function writeOpenClawConfig() {
       providers: modelConfig.providers,
     },
     agents: {
+      ownership: "explicit",
       defaults: {
         model: { primary: modelConfig.primaryModelRef },
+        modelPolicy: {
+          allow: Object.entries(modelConfig.providers).flatMap(([providerId, provider]) =>
+            provider.models.map((model) => `${providerId}/${model.id}`),
+          ),
+        },
+        systemAgent: { agentId: MAIN_AGENT_ID },
+        heartbeat: { agentId: MAIN_AGENT_ID },
         workspace: mainWorkspaceDir,
         subagents: {
           model: modelConfig.subagentModelRef,
@@ -986,14 +1006,16 @@ function writeOpenClawConfig() {
           mode: "off", // No Docker in AgentCore container; microVMs provide isolation
         },
       },
-      list: [mainAgent, domainCommentatorAgent, communicationManagerAgent, ...robotAgents],
+      entries: Object.fromEntries(
+        [mainAgent, domainCommentatorAgent, communicationManagerAgent, ...robotAgents]
+          .map(({ id, ...entry }) => [id, entry]),
+      ),
     },
     tools: {
       profile: "full",
       exec: {
         host: "gateway",  // Run on container host — microVM provides isolation, no Docker sandbox
-        security: "full", // Full shell access; container is already isolated
-        ask: "off",       // Headless container — no approval UI
+        mode: "full", // Headless container; scoped credentials limit AWS access
       },
       deny: [
         "write", // Local writes don't persist — use S3 skill instead
@@ -1041,16 +1063,13 @@ function writeOpenClawConfig() {
       mode: "local",
       port: OPENCLAW_PORT,
       trustedProxies: ["127.0.0.1"],
-      auth: { mode: "token", token: GATEWAY_TOKEN },
+      auth: { mode: "token", token: gatewayToken },
       controlUi: {
         enabled: false,
-        allowInsecureAuth: true,
-        dangerouslyDisableDeviceAuth: true,
-        dangerouslyAllowHostHeaderOriginFallback: true,
-        allowedOrigins: ["*"],
       },
     },
     channels: {}, // No channels — messages bridged via WebSocket
+    cron: { enabled: false }, // EventBridge owns scheduling, including after the version upgrade.
   };
 
   fs.mkdirSync(`${homeDir}/.openclaw`, { recursive: true });
@@ -1081,6 +1100,28 @@ function writeOpenClawConfig() {
   console.log(
     `[contract] OpenClaw workspace defaults prepared for ${managedAgentIds.join(", ")}`,
   );
+  return config;
+}
+
+async function migrateOpenClawWorkspace(env, binary = "openclaw") {
+  const agentsDir = `${env.HOME || "/root"}/.openclaw/agents`;
+  if (!fs.existsSync(agentsDir) ||
+      !listFiles(agentsDir).some((file) => file.endsWith("/openclaw-agent.sqlite"))) {
+    return false;
+  }
+  console.log("[contract] Running offline OpenClaw database migrations...");
+  try {
+    await runFile(binary, ["doctor", "--fix", "--non-interactive", "--no-workspace-suggestions"], {
+      env,
+      timeout: 120000,
+      killSignal: "SIGKILL",
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch (err) {
+    throw new Error(`Offline OpenClaw migration failed: ${err.stderr?.trim() || err.message}`, { cause: err });
+  }
+  console.log("[contract] Offline OpenClaw database migrations completed");
+  return true;
 }
 
 /**
@@ -1378,12 +1419,6 @@ async function init(userId, actorId, channel) {
       console.log("[contract] EXECUTION_ROLE_ARN not set — skipping credential scoping");
     }
 
-    // 1c. Clean up stale lock files restored from S3 (non-blocking)
-    // Runs in parallel with proxy startup — does not block init.
-    const lockCleanupPromise = cleanupLockFiles().catch((err) => {
-      console.warn(`[contract] Lock cleanup failed: ${err.message}`);
-    });
-
     // 2. Start the Bedrock proxy with user identity env vars.
     // Reuse an already-listening proxy instead of racing into EADDRINUSE.
     const existingProxyReady = await waitForPort(PROXY_PORT, "Proxy", 2000, 250);
@@ -1442,17 +1477,12 @@ async function init(userId, actorId, channel) {
         console.log("[contract] Session storage has existing data — skipping S3 restore");
       } else {
         console.log("[contract] Session storage is empty — restoring from S3 backup");
-        workspaceSync.restoreWorkspace(namespace).catch((err) => {
-          console.warn(`[contract] Workspace restore failed: ${err.message}`);
-        }).finally(() => {
-          syncWorkspaceToSessionStorage();
-        });
+        await workspaceSync.restoreWorkspace(namespace);
+        await syncWorkspaceToSessionStorage();
       }
     } else {
       // No session storage — use S3 sync as primary (existing behavior)
-      workspaceSync.restoreWorkspace(namespace).catch((err) => {
-        console.warn(`[contract] Workspace restore failed: ${err.message}`);
-      });
+      await workspaceSync.restoreWorkspace(namespace);
     }
 
     try {
@@ -1466,15 +1496,14 @@ async function init(userId, actorId, channel) {
       console.warn(`[contract] Managed workspace sync failed: ${err.message}`);
     }
     if (sessionStorageAvailable) {
-      syncWorkspaceToSessionStorage();
+      await syncWorkspaceToSessionStorage();
     }
 
-    // Wait for lock cleanup to complete before starting OpenClaw
-    await lockCleanupPromise;
+    // Restore must finish before stale-lock cleanup and gateway startup.
+    await cleanupLockFiles();
 
     // Write OpenClaw config and start gateway (non-blocking)
     writeOpenClawConfig();
-    console.log("[contract] Starting OpenClaw gateway (headless)...");
     // Build scoped env for OpenClaw — excludes container credentials,
     // uses credential_process for scoped S3 access only.
     // Falls back to full process.env if scoped credentials failed.
@@ -1500,6 +1529,12 @@ async function init(userId, actorId, channel) {
     // Propagate INTERNAL_USER_ID so OpenClaw skills (e.g., eventbridge-cron)
     // can resolve the container's authorized userId for DynamoDB writes.
     openclawEnv.INTERNAL_USER_ID = userId;
+    if (await migrateOpenClawWorkspace(openclawEnv)) {
+      writeOpenClawConfig();
+      if (sessionStorageAvailable) await syncWorkspaceToSessionStorage();
+      await workspaceSync.saveWorkspace(namespace);
+    }
+    console.log("[contract] Starting OpenClaw gateway (headless)...");
     openclawProcess = spawn(
       "openclaw",
       ["gateway", "run", "--port", String(OPENCLAW_PORT), "--verbose"],
@@ -1801,6 +1836,7 @@ async function processMessageQueue() {
  * @param {string} [agentId] - Optional agent ID to invoke directly
  * @param {string} [actorId] - Optional actor ID
  * @param {string} [channel] - Optional channel
+ * @param {string} [gatewayToken] - Gateway credential, defaults to the boot-fetched secret
  */
 function enqueueMessage(message, onDelta, agentId, actorId, channel) {
   return new Promise((resolve, reject) => {
@@ -1834,16 +1870,15 @@ async function bridgeMessage(
   agentId = undefined,
   actorId = undefined,
   channel = undefined,
+  gatewayToken = GATEWAY_TOKEN,
 ) {
   const { randomUUID } = require("crypto");
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
     console.log(
       `[contract] Connecting to WebSocket: ${wsUrl} protocol=${protocolVersion}`,
     );
-    const ws = new WebSocket(wsUrl, {
-      origin: `http://127.0.0.1:${OPENCLAW_PORT}`,
-    });
+    const ws = new WebSocket(wsUrl);
     let responseText = "";
     let authenticated = false;
     let chatSent = false;
@@ -1910,13 +1945,13 @@ async function bridgeMessage(
               minProtocol: protocolVersion,
               maxProtocol: protocolVersion,
               client: {
-                id: "openclaw-control-ui",
+                id: "gateway-client",
                 mode: "backend",
                 version: "dev",
                 platform: "linux",
               },
               caps: [],
-              auth: { token: GATEWAY_TOKEN },
+              auth: { token: gatewayToken },
               role: "operator",
               scopes: ["operator.admin", "operator.read", "operator.write"],
             },
@@ -1959,7 +1994,10 @@ async function bridgeMessage(
               expectedProtocol,
               false,
               agentId,
-            ).then(resolve);
+              actorId,
+              channel,
+              gatewayToken,
+            ).then(resolve, reject);
             return;
           }
           done(
@@ -2795,6 +2833,22 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+async function stopOpenClawProcess(child = openclawProcess, timeoutMs = 3000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve, reject) => {
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      reject(new Error("OpenClaw did not stop before the final snapshot deadline"));
+    }, timeoutMs);
+    child.once("exit", onExit);
+    child.kill("SIGTERM");
+  });
+}
+
 // --- SIGTERM handler: save workspace and exit gracefully ---
 process.on("SIGTERM", async () => {
   if (shuttingDown) return;
@@ -2820,14 +2874,17 @@ process.on("SIGTERM", async () => {
     browserHeaderRefreshTimer = null;
   }
 
-  // Save workspace to S3 (10s max)
+  workspaceSync.stopPeriodicSave();
+  // The last committed periodic snapshot remains usable if shutdown exceeds the grace period.
   const saveTimeout = setTimeout(() => {
     console.warn("[contract] Workspace save timeout — exiting");
     process.exit(0);
   }, 10000);
 
   try {
-    syncWorkspaceToSessionStorage();
+    await stopOpenClawProcess();
+    if (sessionSnapshotPromise) await sessionSnapshotPromise;
+    await syncWorkspaceToSessionStorage();
     await workspaceSync.cleanup(currentNamespace);
   } catch (err) {
     console.warn(`[contract] Workspace cleanup error: ${err.message}`);
@@ -2883,5 +2940,8 @@ if (process.env.NODE_ENV !== "test") {
     buildLiteLLMProviderConfig,
     buildAgentCoreProvider,
     normalizeModelCatalog,
+    writeOpenClawConfig,
+    stopOpenClawProcess,
+    migrateOpenClawWorkspace,
   };
 }

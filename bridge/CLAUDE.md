@@ -13,15 +13,12 @@ Use these for real-time information, news, research, and reading web pages. They
 
 ## ClawHub Skills (Pre-installed)
 
-Five community skills are pre-installed from ClawHub (available after full startup ~1-2 min):
+Two community skills are pre-installed from ClawHub (available after full startup ~1-2 min):
 
 | Skill | Purpose |
 |---|---|
 | `jina-reader` | Extract web content as clean markdown (higher quality than built-in web_fetch) |
-| `deep-research-pro` | In-depth multi-step research (spawns sub-agents) |
 | `telegram-compose` | Rich HTML formatting for Telegram messages |
-| `transcript` | YouTube video transcript extraction |
-| `task-decomposer` | Break complex requests into subtasks (spawns sub-agents) |
 
 ## Scheduling (Cron Jobs)
 
@@ -93,7 +90,7 @@ If a user's message contains what looks like an API key or secret — even witho
 
 ## Sub-agents
 
-Skills like `deep-research-pro` and `task-decomposer` can spawn sub-agents for parallel work. Sub-agents use a distinct model name (`bedrock-agentcore-subagent`) routed via `SUBAGENT_BEDROCK_MODEL_ID` env var (defaults to main model). The proxy detects and counts subagent requests separately. Sandbox is disabled — AgentCore microVMs provide per-user isolation.
+Built-in sub-agent tools support delegation for parallel work without a community skill. Sub-agents use a distinct model name (`bedrock-agentcore-subagent`) routed via `SUBAGENT_BEDROCK_MODEL_ID` env var (defaults to main model). The proxy detects and counts subagent requests separately. Sandbox is disabled — AgentCore microVMs provide per-user isolation.
 
 ## Tool Profile
 

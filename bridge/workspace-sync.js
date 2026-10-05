@@ -12,6 +12,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const { createHash, randomUUID } = require("crypto");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
+const { once } = require("events");
+const { createWorkspaceSnapshot, listFiles, publishDirectorySnapshot } = require("./workspace-snapshot");
 const {
   WORKSPACE_FILES,
   getWorkspaceDefaults,
@@ -35,6 +41,7 @@ const LOCAL_PATH = process.env.HOME
 const LOCAL_WORKSPACE_PATH = path.join(LOCAL_PATH, "workspace");
 const LOCAL_WORKSPACES_ROOT = path.join(LOCAL_PATH, "workspaces");
 const WORKSPACE_PREFIX = ".openclaw";
+const SNAPSHOT_PREFIX = ".openclaw-snapshots";
 const MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE = (
   process.env.MANAGED_WORKSPACE_BOOTSTRAP_NAMESPACE || ""
 ).trim();
@@ -245,7 +252,7 @@ async function syncManagedWorkspaceFiles(namespace, agentIds = ["main"]) {
  * Downloads all objects under {namespace}/.openclaw/ to $HOME/.openclaw/.
  * Skips silently if no objects exist (new user).
  */
-async function restoreWorkspace(namespace) {
+async function restoreLegacyWorkspace(namespace) {
   if (!BUCKET || !namespace) {
     console.log("[workspace-sync] No bucket or namespace — skipping restore");
     return;
@@ -312,81 +319,108 @@ async function restoreWorkspace(namespace) {
         fs.writeFileSync(localFile, Buffer.concat(chunks));
         totalFiles++;
       } catch (err) {
-        console.warn(
-          `[workspace-sync] Failed to restore ${relativePath}: ${err.message}`,
-        );
+        throw new Error(`Failed to restore ${relativePath}: ${err.message}`, { cause: err });
       }
     }
-
-    continuationToken = response.IsTruncated
-      ? response.NextContinuationToken
-      : undefined;
+    continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
   } while (continuationToken);
-
-  console.log(
-    `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}`,
-  );
+  console.log(`[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}`);
 }
 
-/**
- * Recursively walk a directory and return all file paths (relative to root).
- */
-function walkDir(dir, root = dir) {
-  const results = [];
+async function hashFile(filename) {
+  const hash = createHash("sha256");
+  for await (const chunk of fs.createReadStream(filename)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function validateSnapshotManifest(manifest) {
+  if (manifest?.version !== 1 || !/^[a-f0-9-]{36}$/.test(manifest.generation) ||
+      !Array.isArray(manifest.files)) {
+    throw new Error("Invalid workspace snapshot manifest");
+  }
+  const seen = new Set();
+  for (const file of manifest.files) {
+    if (!file || typeof file.path !== "string" || !file.path ||
+        path.isAbsolute(file.path) || file.path.includes("\\") ||
+        file.path.split("/").some((part) => !part || part === "." || part === "..") ||
+        shouldSkip(file.path) || seen.has(file.path) ||
+        !Number.isSafeInteger(file.size) || file.size < 0 ||
+        typeof file.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(file.sha256)) {
+      throw new Error("Invalid workspace snapshot file entry");
+    }
+    seen.add(file.path);
+  }
+}
+
+async function restoreWorkspace(namespace) {
+  if (!BUCKET || !namespace) return restoreLegacyWorkspace(namespace);
+  const prefix = `${namespace}/${SNAPSHOT_PREFIX}/`;
+  let response;
   try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        results.push(...walkDir(fullPath, root));
-      } else if (entry.isFile()) {
-        results.push(path.relative(root, fullPath));
+    response = await getS3Client().send(new (getS3Sdk().GetObjectCommand)({
+      Bucket: BUCKET, Key: `${prefix}latest.json`,
+    }));
+  } catch (err) {
+    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
+      return restoreLegacyWorkspace(namespace);
+    }
+    throw err;
+  }
+  const manifest = JSON.parse(await response.Body.transformToString());
+  validateSnapshotManifest(manifest);
+  const staged = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-restore-"));
+  try {
+    for (const file of manifest.files) {
+      const destination = path.join(staged, file.path);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      const object = await getS3Client().send(new (getS3Sdk().GetObjectCommand)({
+        Bucket: BUCKET, Key: `${prefix}${manifest.generation}/${file.path}`,
+      }));
+      if (object.ContentLength !== file.size) {
+        throw new Error(`Snapshot size mismatch: ${file.path}`);
+      }
+      await pipeline(Readable.from(object.Body), fs.createWriteStream(destination));
+      if (fs.statSync(destination).size !== file.size || await hashFile(destination) !== file.sha256) {
+        throw new Error(`Snapshot checksum mismatch: ${file.path}`);
       }
     }
-  } catch (err) {
-    // Directory may not exist yet
+    publishDirectorySnapshot(staged, LOCAL_PATH);
+    console.log(`[workspace-sync] Restored committed snapshot ${manifest.generation} (${manifest.files.length} files)`);
+  } finally {
+    fs.rmSync(staged, { recursive: true, force: true });
   }
-  return results;
 }
-
 /**
  * Save the .openclaw/ directory to S3 for a user namespace.
- * Uploads all files under $HOME/.openclaw/ to {namespace}/.openclaw/.
- * Skips files matching SKIP_PATTERNS and files > MAX_FILE_SIZE.
+ * Publish an immutable generation, then commit its checksum manifest last.
+ * SQLite uses online backup; ordinary files retain the 10 MB limit.
  */
-async function saveWorkspace(namespace) {
+async function saveWorkspaceSnapshot(namespace) {
   if (!BUCKET || !namespace) return;
 
-  const prefix = `${namespace}/${WORKSPACE_PREFIX}/`;
+  const generation = randomUUID();
+  const prefix = `${namespace}/${SNAPSHOT_PREFIX}/`;
   const s3 = getS3Client();
-  const files = walkDir(LOCAL_PATH);
-
-  let uploaded = 0;
-  let skipped = 0;
-
-  for (const relativePath of files) {
-    if (shouldSkip(relativePath)) {
-      skipped++;
-      continue;
-    }
-
-    const localFile = path.join(LOCAL_PATH, relativePath);
-    try {
+  const snapshot = await createWorkspaceSnapshot(LOCAL_PATH, { shouldSkip, includeSymlinks: false });
+  const manifest = { version: 1, generation, createdAt: new Date().toISOString(), files: [] };
+  try {
+    for (const relativePath of listFiles(snapshot.path)) {
+      const localFile = path.join(snapshot.path, relativePath);
       const stat = fs.statSync(localFile);
-      if (stat.size > MAX_FILE_SIZE) {
+      if (stat.size > MAX_FILE_SIZE && !snapshot.sqliteFiles.has(relativePath)) {
         console.warn(
           `[workspace-sync] Skipping ${relativePath} (${stat.size} bytes > ${MAX_FILE_SIZE})`,
         );
-        skipped++;
         continue;
       }
-
-      const content = fs.readFileSync(localFile);
-
-      // Credential detection: warn (but don't block) when secrets are found.
-      // Exempt only the root-level native API key store — user made a conscious choice.
-      // Match exact relative path (not just basename) to prevent bypass via subdirectories.
       if (relativePath !== CREDENTIAL_SCAN_EXEMPT) {
+        const fd = fs.openSync(localFile, "r");
+        const content = Buffer.alloc(Math.min(stat.size, 64 * 1024));
+        try {
+          fs.readSync(fd, content, 0, content.length, 0);
+        } finally {
+          fs.closeSync(fd);
+        }
         const detected = detectCredentials(content);
         if (detected) {
           console.warn(
@@ -395,23 +429,37 @@ async function saveWorkspace(namespace) {
           );
         }
       }
-
-      await s3.send(
-        new (getS3Sdk().PutObjectCommand)({
-          Bucket: BUCKET,
-          Key: `${prefix}${relativePath}`,
-          Body: content,
-        }),
-      );
-      uploaded++;
-    } catch (err) {
-      console.warn(
-        `[workspace-sync] Failed to save ${relativePath}: ${err.message}`,
-      );
+      const sha256 = await hashFile(localFile);
+      const body = fs.createReadStream(localFile);
+      await once(body, "open");
+      try {
+        await s3.send(new (getS3Sdk().PutObjectCommand)({
+          Bucket: BUCKET, Key: `${prefix}${generation}/${relativePath}`,
+          Body: body, ContentLength: stat.size,
+        }));
+      } finally {
+        body.destroy();
+      }
+      manifest.files.push({ path: relativePath, size: stat.size, sha256 });
     }
+    await s3.send(new (getS3Sdk().PutObjectCommand)({
+      Bucket: BUCKET,
+      Key: `${prefix}latest.json`,
+      Body: JSON.stringify(manifest),
+      ContentType: "application/json",
+    }));
+    console.log(`[workspace-sync] Committed snapshot ${generation} (${manifest.files.length} files)`);
+  } finally {
+    snapshot.cleanup();
   }
+}
 
-  console.log(`[workspace-sync] Saved ${uploaded} file(s), skipped ${skipped}`);
+let _savePromise = null;
+function saveWorkspace(namespace) {
+  if (!_savePromise) {
+    _savePromise = saveWorkspaceSnapshot(namespace).finally(() => { _savePromise = null; });
+  }
+  return _savePromise;
 }
 
 // Periodic save state
@@ -453,13 +501,18 @@ function startPeriodicSave(namespace, intervalMs) {
 /**
  * Stop periodic saves and do a final save.
  */
-async function cleanup(namespace) {
+function stopPeriodicSave() {
   if (_saveInterval) {
     clearInterval(_saveInterval);
     _saveInterval = null;
   }
+}
+
+async function cleanup(namespace) {
+  stopPeriodicSave();
   if (namespace) {
     console.log("[workspace-sync] Final save before shutdown...");
+    if (_savePromise) await _savePromise;
     await saveWorkspace(namespace);
   }
 }
@@ -469,6 +522,7 @@ module.exports = {
   saveWorkspace,
   syncManagedWorkspaceFiles,
   startPeriodicSave,
+  stopPeriodicSave,
   cleanup,
   configureCredentials,
   setBackupMode,
@@ -477,4 +531,5 @@ module.exports = {
   shouldSkip,
   detectCredentials,
   CREDENTIAL_SCAN_EXEMPT,
+  validateSnapshotManifest,
 };

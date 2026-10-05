@@ -1,5 +1,8 @@
 const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 process.env.NODE_ENV = "test";
 const contract = require("./agentcore-contract");
@@ -104,5 +107,46 @@ describe("OpenClaw model config", () => {
         }),
       /LITELLM_SUBAGENT_MODEL_ID 'gpt-5\.4-mini' was not found in LITELLM_MODELS_JSON/,
     );
+  });
+
+  it("writes the 2026.9.7 explicit agent roster and model policy", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-config-test-"));
+    const oldHome = process.env.HOME;
+    const oldHumanoid = process.env.HUMANOID_MCP_SERVER_URL;
+    try {
+      process.env.HOME = home;
+      process.env.HUMANOID_MCP_SERVER_URL = "https://example.invalid/mcp";
+      delete process.env.LITELLM_BASE_URL;
+      const config = contract.writeOpenClawConfig({ gatewayToken: "test-token" });
+      assert.equal(config.agents.ownership, "explicit");
+      assert.equal(config.agents.list, undefined);
+      assert.deepEqual(Object.keys(config.agents.entries), [
+        "main", "domain-commentator", "communication-manager",
+        "robot_1", "robot_2", "robot_3", "robot_4", "robot_5", "robot_6",
+      ]);
+      assert.ok(Object.values(config.agents.entries).every((entry) => entry.id === undefined));
+      assert.deepEqual(config.agents.defaults.systemAgent, { agentId: "main" });
+      assert.deepEqual(config.agents.defaults.heartbeat, { agentId: "main" });
+      assert.deepEqual(config.agents.defaults.modelPolicy.allow, [
+        "agentcore/bedrock-agentcore", "agentcore/bedrock-agentcore-subagent",
+      ]);
+      assert.ok(config.agents.entries.robot_1.tools.deny.includes("view_image"));
+      assert.ok(config.agents.entries.robot_1.tools.deny.includes("x_search"));
+      assert.deepEqual(config.channels, {});
+      assert.deepEqual(config.cron, { enabled: false });
+      assert.deepEqual(config.gateway.controlUi, { enabled: false });
+      assert.equal(config.tools.exec.mode, "full");
+      assert.equal(config.tools.exec.security, undefined);
+      assert.equal(config.tools.exec.ask, undefined);
+      assert.equal(config.agents.entries.robot_1.tools.exec.mode, "full");
+      assert.equal(config.gateway.auth.token, "test-token");
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, ".openclaw/openclaw.json"))), config);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+      if (oldHumanoid === undefined) delete process.env.HUMANOID_MCP_SERVER_URL;
+      else process.env.HUMANOID_MCP_SERVER_URL = oldHumanoid;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });

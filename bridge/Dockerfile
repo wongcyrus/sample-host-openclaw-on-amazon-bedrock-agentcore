@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM public.ecr.aws/docker/library/node:22-slim AS builder
+FROM public.ecr.aws/docker/library/node:24.16.0-bookworm-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -19,18 +19,20 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 # Pinned to tested versions — update intentionally to avoid unexpected breaking changes.
 # To upgrade: test the new version locally first, then bump both pins here.
 #   openclaw release notes: https://github.com/openclaw/openclaw/releases
-RUN npm install -g openclaw@2026.6.11 clawhub@0.8.0
+RUN npm install -g openclaw@2026.9.7 clawhub@0.8.0
 
-# Install ClawHub community skills (5 high-value marketplace skills)
+# Install ClawHub community skills (2 high-value marketplace skills)
 # Removed duckduckgo-search (redundant — lightweight agent has built-in web_search),
 # hackernews (niche), news-feed (niche) to reduce startup time.
 # --no-input --force: non-interactive, skip VirusTotal warnings
-RUN for skill in jina-reader deep-research-pro telegram-compose transcript task-decomposer; do \
+RUN for skill in jina-reader telegram-compose; do \
+      installed=0; \
       for attempt in 1 2 3 4 5; do \
-        clawhub install "$skill" --no-input --force && break; \
+        if clawhub install "$skill" --no-input --force; then installed=1; break; fi; \
         echo "Retry $attempt for $skill (waiting 15s)..."; \
         sleep 15; \
       done; \
+      if [ "$installed" -ne 1 ]; then echo "Required ClawHub skill failed: $skill" >&2; exit 1; fi; \
     done
 
 # Create app directory
@@ -76,7 +78,7 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM public.ecr.aws/docker/library/node:22-slim
+FROM public.ecr.aws/docker/library/node:24.16.0-bookworm-slim
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
@@ -117,6 +119,7 @@ COPY dashboard-gateway.js /app/dashboard-gateway.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY workspace-snapshot.js /app/workspace-snapshot.js
 COPY workspace-files.js /app/workspace-files.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
 COPY scoped-credentials.js /app/scoped-credentials.js

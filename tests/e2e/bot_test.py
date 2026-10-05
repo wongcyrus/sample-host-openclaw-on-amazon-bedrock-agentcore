@@ -364,9 +364,9 @@ def _wait_for_full_openclaw(e2e_config, max_wait_s=_OPENCLAW_STARTUP_TIMEOUT_S,
 
 
 class TestSubagent:
-    """Verify sub-agent skills work after full OpenClaw startup.
+    """Verify built-in sub-agent delegation after full OpenClaw startup.
 
-    Tests deep-research-pro and task-decomposer skills, which spawn
+    Tests task planning and delegated research, which spawn
     sub-agents for parallel work. Requires OpenClaw to be fully started
     (not in warm-up mode).
 
@@ -404,10 +404,10 @@ class TestSubagent:
             return None
         return status.get("subagentRequestCount")
 
-    def test_task_decomposer_skill(self, e2e_config):
+    def test_task_delegation(self, e2e_config):
         """Send a task decomposition request and verify structured output.
 
-        The task-decomposer skill spawns sub-agents to break complex
+        Built-in delegation spawns sub-agents to break complex
         requests into manageable subtasks. Verifies the response is
         substantial, came from full OpenClaw (not warm-up shim), and
         that subagentRequestCount increased.
@@ -417,7 +417,8 @@ class TestSubagent:
         since_ms = int(time.time() * 1000)
         result = post_webhook(
             e2e_config,
-            "Break down the task of building a REST API into subtasks",
+            "Use your built-in sub-agent tools to delegate planning a REST API "
+            "to sub-agents, then synthesize their subtasks.",
         )
         assert result.status_code == 200
 
@@ -442,7 +443,7 @@ class TestSubagent:
         after_count = self._get_subagent_count(e2e_config)
         if baseline_count is not None and after_count is not None:
             assert after_count > baseline_count, (
-                f"subagentRequestCount did not increase after task-decomposer "
+                f"subagentRequestCount did not increase after task delegation "
                 f"(before={baseline_count}, after={after_count}). "
                 f"Subagents may not have fired."
             )
@@ -464,8 +465,8 @@ class TestSubagent:
     def test_deep_research_skill(self, e2e_config):
         """Send a deep research request and verify detailed output.
 
-        The deep-research-pro skill spawns sub-agents for multi-step
-        research on complex topics. Verifies the response is detailed,
+        Use built-in sub-agent tools to delegate multi-step research on complex
+        topics. Verifies the response is detailed,
         came from full OpenClaw (not warm-up shim), and that
         subagentRequestCount increased.
         """
@@ -474,7 +475,8 @@ class TestSubagent:
         since_ms = int(time.time() * 1000)
         result = post_webhook(
             e2e_config,
-            "Research the latest advances in quantum computing",
+            "Use your built-in sub-agent tools to research the latest advances in quantum computing. "
+            "Delegate separate research subtasks to sub-agents and synthesize their findings.",
         )
         assert result.status_code == 200
 
@@ -487,7 +489,7 @@ class TestSubagent:
         )
         assert not tail.is_warmup, (
             "Response came from warm-up shim, not full OpenClaw. "
-            "Deep-research-pro skill not available during warm-up."
+            "Built-in sub-agent delegation not available during warm-up."
         )
         assert tail.response_len >= self.MIN_DEEP_RESEARCH_LEN, (
             f"Response too short ({tail.response_len} chars) for deep "
@@ -862,10 +864,7 @@ class TestSkillManagement:
     # Pre-installed skills that should always appear in list
     EXPECTED_PREINSTALLED = [
         "jina-reader",
-        "deep-research-pro",
         "telegram-compose",
-        "transcript",
-        "task-decomposer",
     ]
 
     def test_list_skills(self, e2e_config):
@@ -1826,7 +1825,7 @@ def _cli_send(cfg, text, tail, timeout_s=300):
 
 
 def _cli_subagent(cfg, tail):
-    """Run sub-agent skill tests: task-decomposer and deep-research-pro.
+    """Run built-in sub-agent tests for planning and delegated research.
 
     Always polls CloudWatch during startup wait (regardless of --tail-logs),
     then uses the tail flag for the actual skill invocation logs.
@@ -1841,8 +1840,10 @@ def _cli_subagent(cfg, tail):
     print(f"  OpenClaw ready in {elapsed:.1f}s\n")
 
     prompts = [
-        ("task-decomposer", "Break down the task of building a REST API into subtasks"),
-        ("deep-research-pro", "Research the latest advances in quantum computing"),
+        ("task delegation", "Use your built-in sub-agent tools to delegate planning a REST API "
+         "to sub-agents, then synthesize their subtasks."),
+        ("delegated research", "Use your built-in sub-agent tools to research the latest advances "
+         "in quantum computing. Delegate separate subtasks to sub-agents and synthesize findings."),
     ]
 
     all_ok = True
