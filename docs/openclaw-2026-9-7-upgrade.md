@@ -270,3 +270,27 @@ The reset itself did not change the deployed image (then runtime version 8).
 The subsequent batch-1 rollout reached version 12 and live testing created new
 conversation state. Historical upgrade verification above describes the
 pre-reset state, not retained old user data.
+
+## Retained identity-table KMS permissions
+
+The scheduling failure was traced to DynamoDB, not Scheduler encryption.
+`list_schedules` queries the retained identity table, which still uses an older
+customer-managed KMS key. The runtime execution role had access to the current
+secrets key, but not that table's actual key, causing `kms:Decrypt` denials.
+
+RouterStack already discovers the table's encryption key using `DescribeTable`.
+It now passes that ARN to CronStack, which grants the runtime execution role and
+cron Lambda `kms:Decrypt` and `kms:GenerateDataKey` on that exact key, restricted
+by `kms:ViaService` to the regional DynamoDB service. New tables use the current
+configured key. The fix does not replace the table or key, change the key policy,
+or broaden the scoped STS session policy.
+
+Both retained-key and new-key template regression cases passed, as did dev CDK
+synthesis. IAM simulation allowed the new grant through DynamoDB and rejected
+its use through Secrets Manager. The targeted security review found no issues.
+These checks do not substitute for a live scheduling operation after deployment.
+
+This KMS fix is not deployed. The scoped deployment diff also includes the
+previously committed response-log privacy remediation (runtime image and
+Router/cron Lambda code), so applying it is not an IAM-only rollout. There are
+no table, key, or networking changes in that diff.

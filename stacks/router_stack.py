@@ -124,6 +124,7 @@ class RouterStack(Stack):
                 "AWS credentials or the DynamoDB endpoint are unavailable."
             ) from err
 
+        self.identity_table_kms_arn = identity_table_kms_arn
         identity_cmk = kms.Key.from_key_arn(self, "IdentityTableCmk", cmk_arn)
         if reuse_identity_table:
             self.identity_table = dynamodb.Table.from_table_arn(

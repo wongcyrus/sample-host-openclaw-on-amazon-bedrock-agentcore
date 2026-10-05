@@ -134,6 +134,7 @@ cron_stack = CronStack(
     namer.stack("OpenClawCron"),
     identity_table_name=_identity_table_name,
     identity_table_arn=_identity_table_arn,
+    identity_table_kms_arn=router_stack.identity_table_kms_arn,
     telegram_token_secret_name=telegram_secret["name"],
     telegram_token_secret_arn=telegram_secret["arn"],
     slack_token_secret_name=slack_secret["name"],

@@ -32,6 +32,7 @@ class CronStack(Stack):
         *,
         identity_table_name: str,
         identity_table_arn: str,
+        identity_table_kms_arn: str,
         telegram_token_secret_name: str,
         telegram_token_secret_arn: str,
         slack_token_secret_name: str,
@@ -190,6 +191,17 @@ class CronStack(Stack):
                 resources=[cmk_arn],
             )
         )
+        identity_table_kms_policy = iam.PolicyStatement(
+            actions=["kms:Decrypt", "kms:GenerateDataKey"],
+            resources=[identity_table_kms_arn],
+            conditions={
+                "StringEquals": {
+                    "kms:ViaService": f"dynamodb.{region}.amazonaws.com",
+                },
+            },
+        )
+        self.cron_fn.add_to_role_policy(identity_table_kms_policy)
+        agentcore_execution_role.add_to_policy(identity_table_kms_policy)
 
         # --- AgentCore Execution Role Additions ---
         # Allow the container to create/manage EventBridge schedules
