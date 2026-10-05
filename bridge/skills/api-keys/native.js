@@ -14,11 +14,25 @@ function getApiKeysPath() {
 }
 
 function readApiKeys() {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(getApiKeysPath(), "utf-8"));
-  } catch {
-    return {};
+    raw = fs.readFileSync(getApiKeysPath(), "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT") return {};
+    console.error(`Error: native key file is unreadable (${err.code || err.name}); not modified.`);
+    process.exit(1);
   }
+  let keys;
+  try {
+    keys = JSON.parse(raw);
+  } catch {
+    keys = undefined;
+  }
+  if (!keys || typeof keys !== "object" || Array.isArray(keys)) {
+    console.error("Error: native key file is not a valid JSON object; not modified.");
+    process.exit(1);
+  }
+  return keys;
 }
 
 function writeApiKeys(keys) {

@@ -5,7 +5,7 @@ FROM public.ecr.aws/docker/library/node:24.16.0-bookworm-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
+    apt-get install -y --no-install-recommends ca-certificates curl jq git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
 # Install AWS CLI and Python dependencies for bundled robot skills
@@ -82,8 +82,9 @@ FROM public.ecr.aws/docker/library/node:24.16.0-bookworm-slim
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq python3 && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends ca-certificates curl jq python3 && \
+    rm -rf /var/lib/apt/lists/* && \
+    test -s /etc/ssl/certs/ca-certificates.crt
 
 # Copy AWS CLI from builder
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
@@ -115,6 +116,7 @@ RUN mkdir -p /root/.openclaw
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
+COPY read-body.js chat-run-filter.js /app/
 COPY dashboard-gateway.js /app/dashboard-gateway.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js

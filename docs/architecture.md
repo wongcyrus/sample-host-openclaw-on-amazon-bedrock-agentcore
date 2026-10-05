@@ -153,8 +153,8 @@
   WebSocket bridge: auth -> chat.send -> streaming deltas -> final
          |
          v
-  Contract sends Telegram reply when streaming is enabled;
-  Router Lambda sends it otherwise (avoids duplicate delivery)
+  Router Lambda formats and chunks the Telegram reply;
+  contract sends plain-text fallback only if the caller disconnects
          |
          v
   (Subsequent messages reuse the warm microVM — fast response)

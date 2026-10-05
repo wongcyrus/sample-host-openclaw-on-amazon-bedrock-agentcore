@@ -179,6 +179,13 @@ class TestMarkdownToTelegramHtml(unittest.TestCase):
         self.assertNotIn('| ---', result)
         self.assertIn('<b>1</b>', result)
 
+    def test_table_preserves_already_bold_names(self):
+        for name in ("**Status**", "__Status__"):
+            result = index._markdown_to_telegram_html(
+                f"| Name | Value |\n|---|---|\n| {name} | Ready |"
+            )
+            self.assertEqual(result, "\u2022 <b>Status</b> \u2014 Ready")
+
     def test_table_separator_variations(self):
         """Various separator row styles are handled."""
         for sep in ["|---|---|", "|-----|-----|", "|:---|---:|", "|:---:|:---:|"]:

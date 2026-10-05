@@ -13,6 +13,7 @@ const ORIGINAL_ENV = {
   LITELLM_MODELS_JSON: process.env.LITELLM_MODELS_JSON,
   LITELLM_PRIMARY_MODEL_ID: process.env.LITELLM_PRIMARY_MODEL_ID,
   LITELLM_SUBAGENT_MODEL_ID: process.env.LITELLM_SUBAGENT_MODEL_ID,
+  LITELLM_FALLBACK_MODEL_IDS: process.env.LITELLM_FALLBACK_MODEL_IDS,
 };
 
 function restoreEnv() {
@@ -89,6 +90,55 @@ describe("OpenClaw model config", () => {
     assert.equal(config.providers.litellm.apiKey, "test-key");
     assert.equal(config.providers.litellm.headers.Authorization, "Bearer test-key");
     assert.equal(config.providers.litellm.headers["x-api-key"], "test-key");
+  });
+
+  it("writes the enabled model fallback order for main, managed agents and subagents", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-fallback-test-"));
+    const oldHome = process.env.HOME;
+    try {
+      process.env.HOME = home;
+      process.env.LITELLM_BASE_URL = "https://litellm.example.invalid/v1";
+      process.env.LITELLM_API_KEY = "test-key";
+      process.env.LITELLM_MODELS_JSON = JSON.stringify(
+        ["kimi-k3", "kimi-k2.5", "minimax-m2.5", "nova-2-lite"].map((id) => ({ id, name: id })),
+      );
+      process.env.LITELLM_PRIMARY_MODEL_ID = "kimi-k3";
+      process.env.LITELLM_SUBAGENT_MODEL_ID = "kimi-k3";
+      process.env.LITELLM_FALLBACK_MODEL_IDS = JSON.stringify(
+        ["kimi-k2.5", "minimax-m2.5", "nova-2-lite"],
+      );
+      const config = contract.writeOpenClawConfig({ gatewayToken: "test-token" });
+      const expected = {
+        primary: "litellm/kimi-k3",
+        fallbacks: ["litellm/kimi-k2.5", "litellm/minimax-m2.5", "litellm/nova-2-lite"],
+      };
+      assert.deepEqual(config.agents.defaults.model, expected);
+      assert.deepEqual(config.agents.defaults.subagents.model, expected);
+      for (const entry of Object.values(config.agents.entries)) {
+        assert.deepEqual(entry.model, expected);
+      }
+      assert.deepEqual(config.agents.defaults.modelPolicy.allow, [expected.primary, ...expected.fallbacks]);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects missing, duplicate or malformed fallback catalog IDs", () => {
+    const env = {
+      LITELLM_BASE_URL: "https://litellm.example.invalid/v1",
+      LITELLM_API_KEY: "test-key",
+      LITELLM_MODELS_JSON: JSON.stringify([{ id: "kimi-k3", name: "kimi-k3" }]),
+      LITELLM_PRIMARY_MODEL_ID: "kimi-k3",
+      LITELLM_SUBAGENT_MODEL_ID: "kimi-k3",
+    };
+    for (const ids of ['["disabled-model"]', '["kimi-k3","kimi-k3"]', '{}', 'broken']) {
+      assert.throws(
+        () => contract.buildOpenClawModelConfig({ env: { ...env, LITELLM_FALLBACK_MODEL_IDS: ids } }),
+        /LITELLM_FALLBACK_MODEL_IDS/,
+      );
+    }
   });
 
   it("fails fast when LiteLLM ids do not match the catalog", () => {

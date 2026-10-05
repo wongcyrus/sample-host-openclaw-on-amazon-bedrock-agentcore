@@ -29,6 +29,13 @@ PATTERNS = {
     "response_to_send": re.compile(
         r"Response to send \(len=(\d+)\): (.+)", re.DOTALL
     ),
+    "response_metadata": re.compile(
+        r"Response metadata len=(\d+) warmup=(True|False) content_blocks=(True|False) "
+        r"markdown_table=(True|False) json_array=(True|False)"
+    ),
+    "telegram_delivery_accepted": re.compile(
+        r"Telegram delivery accepted format=(HTML|plain) len=(\d+)"
+    ),
     "telegram_sent": re.compile(
         r"Telegram response sent to chat_id=(\S+)"
     ),
@@ -50,9 +57,15 @@ class TailResult:
     message_received: bool = False
     agentcore_invoked: bool = False
     agentcore_response: str = ""
-    response_text: str = ""
+    _response_text: str = ""
+    warmup: Optional[bool] = None
+    content_blocks: Optional[bool] = None
+    markdown_table: Optional[bool] = None
+    json_array: Optional[bool] = None
     response_len: int = 0
     telegram_sent: bool = False
+    delivered_chunks: int = 0
+    plain_text_fallback: bool = False
     new_session: bool = False
     new_user: bool = False
     session_id: str = ""
@@ -62,6 +75,20 @@ class TailResult:
     raw_lines: List[str] = field(default_factory=list)
     timed_out: bool = False
     elapsed_s: float = 0.0
+
+    @property
+    def response_text(self) -> str:
+        if not self._response_text:
+            raise RuntimeError(
+                "Response contents are not logged. This content-dependent test "
+                "requires a separate authenticated channel capture; use delivery "
+                "metadata for lifecycle and formatting checks."
+            )
+        return self._response_text
+
+    @response_text.setter
+    def response_text(self, value: str) -> None:
+        self._response_text = value
 
     @property
     def full_lifecycle(self) -> bool:
@@ -80,7 +107,9 @@ class TailResult:
         When OpenClaw is fully running, responses route through the WebSocket
         bridge and never contain this footer.
         """
-        return "warm-up mode" in self.response_text.lower()
+        if self.warmup is None and not self._response_text:
+            raise RuntimeError("Warm-up metadata was not observed")
+        return self.warmup if self.warmup is not None else "warm-up mode" in self._response_text.lower()
 
 
 def _parse_line(line: str, result: TailResult) -> None:
@@ -101,7 +130,7 @@ def _parse_line(line: str, result: TailResult) -> None:
             result.agentcore_response = m.group(1)
             # Pre-extraction fallback — only set if response_to_send
             # hasn't provided the post-extraction text yet
-            if not result.response_text:
+            if not result._response_text:
                 try:
                     body = json.loads(m.group(1))
                     if isinstance(body, dict) and "response" in body:
@@ -114,8 +143,20 @@ def _parse_line(line: str, result: TailResult) -> None:
             # Always update — this is the post-extraction text that
             # actually gets sent to the user
             result.response_text = m.group(2)
+        elif name == "response_metadata":
+            result.response_len = int(m.group(1))
+            result.warmup = m.group(2) == "True"
+            result.content_blocks = m.group(3) == "True"
+            result.markdown_table = m.group(4) == "True"
+            result.json_array = m.group(5) == "True"
         elif name == "telegram_sent":
             result.telegram_sent = True
+        elif name == "telegram_delivery_accepted":
+            if result.delivered_chunks == 0:
+                result.response_len = 0
+            result.response_len += int(m.group(2))
+            result.plain_text_fallback |= m.group(1) == "plain"
+            result.delivered_chunks += 1
         elif name == "new_session":
             result.new_session = True
             result.session_id = m.group(1)

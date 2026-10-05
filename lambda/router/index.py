@@ -674,7 +674,7 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
                     body_text = body_text[:MAX_RESPONSE_BYTES]
             else:
                 body_text = str(body)[:MAX_RESPONSE_BYTES]
-            logger.info("AgentCore response (len=%d, first 200 chars): %s", len(body_text), body_text[:200])
+            logger.info("AgentCore response received len=%d", len(body_text))
             try:
                 return json.loads(body_text)
             except json.JSONDecodeError:
@@ -844,7 +844,9 @@ def _tables_to_bullets(text):
                 elif len(cols) >= 2:
                     name = cols[0]
                     desc = ' \u2014 '.join(cols[1:])
-                    bullets.append(f'\u2022 **{name}** \u2014 {desc}')
+                    if not re.fullmatch(r'(\*\*|__).+\1', name):
+                        name = f'**{name}**'
+                    bullets.append(f'\u2022 {name} \u2014 {desc}')
 
             result.extend(bullets)
         else:
@@ -945,11 +947,12 @@ def send_telegram_message(chat_id, text, token):
     """Send a message via Telegram Bot API.
 
     Converts Markdown to Telegram HTML for rich formatting. Falls back to
-    plain text if Telegram rejects the HTML (e.g., malformed tags).
+    plain text if Telegram rejects the HTML (e.g., malformed tags). Returns
+    True if either send was accepted, False otherwise.
     """
     if not token:
         logger.error("No Telegram token available")
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     # Try with HTML (converted from Markdown)
@@ -962,7 +965,8 @@ def send_telegram_message(chat_id, text, token):
     req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
         urllib_request.urlopen(req, timeout=10)
-        return
+        logger.info("Telegram delivery accepted format=HTML len=%d", len(html_text))
+        return True
     except Exception as e:
         logger.warning("Telegram HTML send failed (retrying as plain text): %s", e)
 
@@ -974,8 +978,84 @@ def send_telegram_message(chat_id, text, token):
     req = urllib_request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
         urllib_request.urlopen(req, timeout=10)
+        logger.info("Telegram delivery accepted format=plain len=%d", len(text))
+        return True
     except Exception as e:
         logger.error("Failed to send Telegram message to %s: %s", chat_id, e)
+        return False
+
+
+TELEGRAM_MAX_UTF16_UNITS = 4096
+TELEGRAM_CHUNK_UTF16_UNITS = 4000
+
+
+def _utf16_len(text):
+    """Return text length in UTF-16 code units, as Telegram counts it."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _best_break(window):
+    """Prefer paragraph, line, and word breaks outside code fences."""
+    fences = [match.start() for match in re.finditer(r"```", window)]
+    floor = len(window) // 2
+
+    def outside_fence(cut):
+        return sum(1 for fence in fences if fence + 3 <= cut) % 2 == 0
+
+    for require_fence_balance in (True, False):
+        for separator in ("\n\n", "\n", " "):
+            pos = window.rfind(separator)
+            while pos >= 0 and pos + len(separator) > floor:
+                cut = pos + len(separator)
+                if not require_fence_balance or outside_fence(cut):
+                    return cut
+                pos = window.rfind(separator, 0, pos)
+    return len(window)
+
+
+def _split_telegram_text(text, limit=TELEGRAM_CHUNK_UTF16_UNITS):
+    """Split at safe boundaries into chunks within Telegram's UTF-16 limit."""
+    chunks = []
+    rest = text or ""
+    while rest:
+        if _utf16_len(rest) <= limit:
+            chunks.append(rest)
+            break
+        units = 0
+        fit = 0
+        for char in rest:
+            units += 2 if ord(char) > 0xFFFF else 1
+            if units > limit:
+                break
+            fit += 1
+        cut = _best_break(rest[:fit]) if fit else 1
+        chunks.append(rest[:cut])
+        rest = rest[cut:]
+    return chunks
+
+
+def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS, retry=True):
+    """Send bounded Telegram messages; retry rejected chunks at half size."""
+    chunks = _split_telegram_text(text, limit)
+    delivered_all = True
+    for number, chunk in enumerate(chunks, 1):
+        if send_telegram_message(chat_id, chunk, token):
+            continue
+        size = _utf16_len(chunk)
+        if retry and size > limit // 2:
+            logger.warning(
+                "Telegram chunk %d/%d (%d UTF-16 units) rejected; retrying in smaller pieces",
+                number, len(chunks), size,
+            )
+            if _send_telegram_chunks(chat_id, chunk, token, limit // 2, retry=False):
+                continue
+        else:
+            logger.error(
+                "Dropped Telegram chunk %d/%d (%d UTF-16 units) for %s after send failed",
+                number, len(chunks), size, chat_id,
+            )
+        delivered_all = False
+    return delivered_all
 
 
 def send_telegram_typing(chat_id, token):
@@ -1567,20 +1647,26 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
+    rendered_text = _markdown_to_telegram_html(response_text)
+    logger.info(
+        "Response metadata len=%d warmup=%s content_blocks=%s markdown_table=%s json_array=%s",
+        len(rendered_text),
+        "warm-up mode" in response_text.lower(),
+        bool(re.search(r'\[\s*\{\s*"type"\s*:\s*"text"', rendered_text)),
+        bool(re.search(r"^\s*\|[\s:|-]+\|\s*$", rendered_text, re.MULTILINE)),
+        rendered_text.lstrip().startswith("[{"),
+    )
 
     # If contract already streamed progressively to Telegram, skip duplicate send
     if result.get("streamed"):
         logger.info("Telegram response already streamed by contract — skipping send to chat_id=%s", chat_id)
         return
 
-    # Send response (split if > 4096 chars for Telegram limit)
-    if len(response_text) <= 4096:
-        send_telegram_message(chat_id, response_text, token)
+    # Send response within Telegram's 4096 UTF-16-unit limit.
+    if _send_telegram_chunks(chat_id, response_text, token):
+        logger.info("Telegram response sent to chat_id=%s", chat_id)
     else:
-        for i in range(0, len(response_text), 4096):
-            send_telegram_message(chat_id, response_text[i:i + 4096], token)
-    logger.info("Telegram response sent to chat_id=%s", chat_id)
+        logger.error("Telegram response delivery incomplete for chat_id=%s", chat_id)
 
 
 def handle_slack(body, headers=None):

@@ -11,7 +11,7 @@ const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
+const { _setSecretsManagerForTests } = require("./lightweight-agent");
 const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch, executeManageApiKey, readApiKeys, writeApiKeys, getApiKeysPath, VALID_KEY_NAME, executeManageSecret, buildSecretName, _secretsCache, MAX_SECRETS_PER_USER, executeRetrieveApiKey, executeMigrateApiKey, SM_REQUEST_TIMEOUT_MS } = require("./lightweight-agent");
 
 // --- TOOLS array ---
@@ -710,7 +710,7 @@ describe("manage_api_key", () => {
   let origHome;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "apikeys-test-"));
+    tmpDir = fs.mkdtempSync(path.join(__dirname, ".apikeys-test-"));
     origHome = process.env.HOME;
     process.env.HOME = tmpDir;
     // Ensure .openclaw directory exists
@@ -927,13 +927,23 @@ describe("retrieve_api_key", () => {
   let origHome;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "retrieve-test-"));
+    tmpDir = fs.mkdtempSync(path.join(__dirname, ".retrieve-test-"));
     origHome = process.env.HOME;
     process.env.HOME = tmpDir;
     fs.mkdirSync(path.join(tmpDir, ".openclaw"), { recursive: true });
+    _secretsCache.clear();
+    _setSecretsManagerForTests({
+      async send() {
+        const err = new Error("Secret not found");
+        err.name = "ResourceNotFoundException";
+        throw err;
+      },
+    }, { GetSecretValueCommand: class { constructor(input) { this.input = input; } } });
   });
 
   afterEach(() => {
+    _setSecretsManagerForTests(null, null);
+    _secretsCache.clear();
     process.env.HOME = origHome;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });

@@ -7,6 +7,7 @@
  */
 
 const http = require("http");
+const { readBody } = require("./read-body");
 const crypto = require("crypto");
 const fs = require("fs");
 const {
@@ -1425,9 +1426,7 @@ const server = http.createServer(async (req, res) => {
 
   // Chat completions endpoint
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", async () => {
+    readBody(req).then(async (body) => {
       try {
         const parsed = JSON.parse(body);
         const messages = parsed.messages || [];
@@ -1610,7 +1609,7 @@ const server = http.createServer(async (req, res) => {
           );
         }
       }
-    });
+    }, () => req.destroy());
     return;
   }
 

@@ -16,11 +16,23 @@ function getApiKeysPath() {
 }
 
 function readApiKeys() {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(getApiKeysPath(), "utf-8"));
-  } catch {
-    return {};
+    raw = fs.readFileSync(getApiKeysPath(), "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT") return {};
+    throw new Error(`native key file is unreadable (${err.code || err.name}); not modified.`);
   }
+  let keys;
+  try {
+    keys = JSON.parse(raw);
+  } catch {
+    keys = undefined;
+  }
+  if (!keys || typeof keys !== "object" || Array.isArray(keys)) {
+    throw new Error("native key file is not a valid JSON object; not modified.");
+  }
+  return keys;
 }
 
 function writeApiKeys(keys) {
@@ -107,7 +119,11 @@ async function main() {
       process.exit(1);
     }
 
-    // Write to native
+    if (typeof value !== "string" || value === "") {
+      throw new Error(`secret '${keyName}' has no string value; nothing migrated.`);
+    }
+
+    // Write to native before deleting the source.
     const keys = readApiKeys();
     keys[keyName] = value;
     writeApiKeys(keys);
@@ -115,7 +131,7 @@ async function main() {
     // Delete from Secrets Manager
     await client.send(new DeleteSecretCommand({
       SecretId: secretName,
-      ForceDeleteWithoutRecovery: true,
+      RecoveryWindowInDays: 7,
     }));
 
     console.log(`Key '${keyName}' migrated from Secrets Manager to native.`);

@@ -80,7 +80,7 @@ can clear session storage, so S3 recovery remains necessary.
 | Snapshot integrity failed with `unknown function: octet_length()` | System Python SQLite was older than the runtime engine. Replaced Python snapshot/validation with Node SQLite and added a schema-function regression test. |
 | Restored gateway exited with code 78 | Logs required offline media migration for agent schema v1. Added supported Doctor repair before gateway startup; verified v1-to-v24 migration and integrity using restored state. |
 | Committed S3 restore failed with `EXDEV` | The AgentCore filesystem rejected whole-root directory rename. Added journaled in-place publication and interruption recovery; exercised a real mounted root and a new deployed microVM. |
-| E2E lifecycle test timed out despite Telegram delivery | The existing log matcher recognizes Router sends, not contract-streamed delivery. Correlated Router logs with contract `Telegram streaming finalized` events and confirmed actual delivery. The old matcher remains a known test limitation. |
+| E2E lifecycle test timed out despite Telegram delivery | At the original upgrade, the log matcher recognized Router sends, not contract-streamed delivery. Batch 1 subsequently restored normal Router delivery; the matcher now also checks metadata-only Telegram delivery acknowledgements. |
 
 The first attempts were rolled back to the previous image while migration was
 debugged. The final deployment includes the fixes above; it is not the temporary
@@ -133,11 +133,140 @@ cdk deploy OpenClawAgentCore-dev --exclusively \
 These AZ names preserve this account's existing dev layout; do not copy them to
 another account without inspecting its deployed template and diff.
 
-Pre-upgrade runtime configuration, CloudFormation template, and workspace copies
-were retained privately for rollback. Workspace copies are in the dev user-files
-bucket under `_deployment-rollbacks/`, including a final pre-migration copy.
+At deployment time, pre-upgrade runtime configuration, CloudFormation template,
+and workspace copies were retained privately for rollback. The workspace copies
+were under `_deployment-rollbacks/` in the dev user-files bucket. **The subsequent
+authorized dev reset deleted those copies and all other dev user S3 versions;
+state rollback to that deployment is no longer available.**
 Retain both the old image **and pre-migration state**: the old runtime cannot be
 assumed to understand migrated schemas or new S3 manifests. A runtime image
 rollback alone is insufficient after state migration. Stop current sessions
 before changing runtime/state, and verify the next session uses the intended
 image and a compatible restored workspace.
+
+## Selective upstream fixes: batch 1
+
+The existing upgrade was committed as `2fead53`. Batch 1 was adapted from the
+official AWS repository rather than merging its `main` branch: our OpenClaw
+`2026.9.7` pin, generated agent configuration, dashboard/direct-agent routing,
+gateway authentication, offline migration, and immutable SQLite backups remain
+intact. Batch 1 and the live-discovered repairs below are now deployed to dev;
+the final AgentCore runtime and `DEFAULT` endpoint are both **version 12**.
+Production was not deployed. The batch changes remain uncommitted.
+
+| Official change | Local adaptation |
+|---|---|
+| `b0c427f`, `100a21c`, `b2f4c3f` (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#140, aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#131, aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#123) | Normal Telegram replies go through Router markdown-to-HTML formatting and UTF-16-safe splitting. Cron uses the same limit-aware delivery behavior. The contract maintains typing indicators but sends a chunked plain-text fallback only when the invocation caller disconnects. |
+| `5d452ba` (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#135) | Filter gateway chat events by run ownership, including yielded successors, so unrelated/sub-agent events cannot complete the wrong invocation. |
+| `772ece1`, `608e19f` (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#127, aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#136) | Buffer HTTP bytes and decode UTF-8 once, preserving CJK and emoji across network chunk boundaries. Contract and proxy share `read-body.js`; lightweight HTTP responses follow the same byte-buffering principle. |
+| `e09cafb`, `e2e0769`, `ca7cfc2` (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#129, aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#130, aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#132) | Preserve API-key migration sources on failed reads/writes, reject corrupt native JSON instead of overwriting it, and use a seven-day Secrets Manager deletion recovery window. |
+| `819ea5e` (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#119) | Validate DNS addresses at the actual HTTP connection, including redirects and IPv4-mapped IPv6 addresses, rather than relying only on a preflight lookup. |
+| `bbb0906` (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#112) | Install CA certificates explicitly in both build stages and assert the runtime trust bundle exists in both Dockerfiles. |
+| Selected `4a6bf6c` changes (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#117) | Forward guardrail ID/version into the proxy's explicit child-process environment; do not replace our storage implementation with the rest of this upstream patch. |
+| `7ab44b5` (aws-samples/sample-host-openclaw-on-amazon-bedrock-agentcore#126) | Make Secrets Manager tests hermetic using SDK stubs, without requiring a configured AWS region or credentials. |
+
+ClawHub runtime persistence and the skills dependency symlink were explicitly
+excluded. This batch does not add or remove baked-in skills.
+
+Final validation covered **316 combined bridge/storage/configuration tests** and
+**68 Python formatting, delivery, and E2E-observation regression tests**.
+The ARM64 CDK Dockerfile built successfully, and its resulting container contained
+the CA bundle and both new helpers. OpenClaw `2026.9.7` itself accepted the generated
+ordered-fallback configuration using `openclaw config validate`.
+
+The final deployed targeted suite passed **8 live tests**: health, webhook
+acceptance/rejection, message lifecycle, three Telegram formatting checks, and
+actual sub-agent completion. This is not the full 50-test E2E suite: Browser
+remains disabled and skill-management tests were intentionally excluded.
+
+### Live-discovered repairs and provider configuration
+
+Router-only rich delivery exposed a table conversion bug: a first-column cell
+already wrapped in `**bold**` was wrapped again, producing overlapping HTML tags.
+Telegram rejected that HTML and used plain-text fallback. Router and Cron now
+avoid the duplicate wrapper, with regression coverage for both bold syntaxes.
+The final table E2E test requires Telegram to accept HTML without falling back.
+The Router reports incomplete delivery as an error, not a success.
+
+New delivery acknowledgements log **only format and length**, never per-chunk
+message content. A targeted security review identified excess reply logging
+in the initial implementation; that medium-severity finding was fixed, and
+the follow-up review reported no remaining findings. The later pre-commit secret
+review also identified the pre-existing response preview as a potential API-key
+leak. The pending commit removes raw AgentCore response previews from Router
+and Cron, the Telegram response preview, and the cron event payload log.
+Telegram observations now log only length, warm-up status, and boolean
+format-shape flags, plus delivery format/length. Synthetic credential-bearing
+regressions check that replies still reach the caller without appearing in logs.
+
+The log-based E2E harness uses those metadata fields for lifecycle, warm-up,
+formatting, and delegation checks. Content-dependent tests now fail explicitly
+when reply content is unavailable, rather than passing negative checks against an
+empty string; they require a separate authenticated channel capture. This
+pre-commit logging remediation has **not yet been deployed**, and does not remove
+historical CloudWatch records. Runtime version 12 remains the previously verified
+deployment described below.
+
+Before committing, all 30 staged files were reviewed for credentials and checked
+against configured dev secret values without printing those values. No configured
+secret or private-key block was found, and `.env.dev` remained ignored and
+excluded. The logging remediation passed **73 Python regressions**; the
+**316 bridge regressions** also passed. The final staged security review reported
+no findings. This does not certify or erase historical logs or unrelated runtime
+logging outside the reviewed changes.
+
+The user's LiteLLM provider has OpenAI and Gemini disabled. Dev previously
+selected disabled `gpt-5.4-mini` for sub-agents, causing provider HTTP 502 errors.
+The final main, managed-agent, and sub-agent configuration uses:
+
+```text
+kimi-k3 -> kimi-k2.5 -> minimax-m2.5 -> nova-2-lite
+```
+
+All four models passed direct provider canaries. Both authorization headers
+(`Authorization` and `x-api-key`) are required by this API Gateway-backed provider;
+omitting `x-api-key` caused the initial local canaries to return HTTP 403.
+`LITELLM_FALLBACK_MODEL_IDS` is an optional JSON array of unique catalog IDs,
+forwarded by CDK into OpenClaw's native model fallback objects. Disabled models
+are absent from the dev catalog and model-policy allowlist.
+
+The old delegation check used a Bedrock-proxy request counter, which LiteLLM
+bypasses. Gateway session listings also did not expose the child runs used by
+this deployment. The E2E check now deduplicates completed child-run IDs from the
+latest microVM log stream initialized for the test user; it does not rely on
+bot-reported success. A unique run marker forces fresh work rather than allowing
+the model to summarize prior results. The final trace recorded five completed
+child runs and confirmed the ready gateway uses `litellm/kimi-k3`.
+
+**Remaining observations:** the final cold-start test window included one Router
+invocation returning a runtime HTTP 502, although the subsequent full lifecycle
+passed. Some LiteLLM `kimi-k2.5` child attempts still emitted
+`Provider returned an incomplete or malformed tool call`; successful child
+completions and parent synthesis were observed afterward. Passing the targeted
+suite is not a claim that every provider attempt succeeded or that scheduling,
+web search, images, or forced failover across every model was verified.
+
+## Authorized fresh dev reset
+
+After explicit approval to reset all dev user identities, files, and schedules,
+the reset was confined to `us-east-1` dev resources. Production and infrastructure
+were not changed. Router and cron Lambda concurrency was temporarily set to
+zero during deletion and restored afterward.
+
+The reset removed 10 identity/session/binding records, 26 Cognito users, and all
+non-bootstrap S3 objects, historical versions, and delete markers, including
+immutable workspace generations and deployment rollback copies. More than
+600,000 S3 version entries were purged. The dev Scheduler group already contained
+zero schedules. Recorded runtime sessions were already absent.
+
+Shared `workspace-bootstrap/` objects and infrastructure/channel credentials
+were preserved. Only the two configured Telegram operator allowlist entries were
+recreated; user profiles and session pointers were not. The next registration
+therefore creates a new identity and runtime session rather than reusing a
+stopped session's storage or recovering an old workspace. The fresh workspace
+still receives the deliberately preserved managed bootstrap.
+
+The reset itself did not change the deployed image (then runtime version 8).
+The subsequent batch-1 rollout reached version 12 and live testing created new
+conversation state. Historical upgrade verification above describes the
+pre-reset state, not retained old user data.

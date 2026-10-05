@@ -378,15 +378,22 @@ LiteLLM is configured directly in the selected deploy env file (`.env.dev` or `.
 ```bash
 LITELLM_BASE_URL=https://your-litellm.example/v1
 LITELLM_API_KEY=your-key
-LITELLM_MODELS_JSON='[{"id":"kimi-k2.5","name":"kimi-k2.5"},{"id":"gpt-5.4-mini","name":"gpt-5.4-mini"}]'
-LITELLM_PRIMARY_MODEL_ID=kimi-k2.5
-LITELLM_SUBAGENT_MODEL_ID=gpt-5.4-mini
+LITELLM_MODELS_JSON='[{"id":"kimi-k3","name":"kimi-k3"},{"id":"kimi-k2.5","name":"kimi-k2.5"},{"id":"minimax-m2.5","name":"minimax-m2.5"},{"id":"nova-2-lite","name":"nova-2-lite"}]'
+LITELLM_PRIMARY_MODEL_ID=kimi-k3
+LITELLM_SUBAGENT_MODEL_ID=kimi-k3
+LITELLM_FALLBACK_MODEL_IDS='["kimi-k2.5","minimax-m2.5","nova-2-lite"]'
 ```
 
 Reference project (endpoint + key source):
 
 - https://github.com/wongcyrus/litellm-aws-lambda-microvm-serverless
 - `LITELLM_BASE_URL` and `LITELLM_API_KEY` should be copied from that LiteLLM deployment.
+
+Only list models enabled on your provider. The optional fallback JSON array must
+contain unique IDs from that catalog; it sets OpenClaw's native ordered fallback
+chain for the main agent, managed agents, and sub-agents. Omitting it preserves
+single-model behavior. Dev uses Kimi K3, then Kimi K2.5, MiniMax M2.5, and Nova 2
+Lite; disabled OpenAI and Gemini models are not in its allowlist.
 
 OpenClaw sends the same key in both headers when calling LiteLLM:
 

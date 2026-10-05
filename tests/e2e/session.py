@@ -1,6 +1,8 @@
 """DynamoDB session and user management for E2E tests."""
 
 import json
+import re
+import time
 from typing import Optional
 
 import boto3
@@ -178,5 +180,39 @@ def get_agent_status(cfg: E2EConfig) -> Optional[dict]:
             return json.loads(inner) if isinstance(inner, str) else inner
     except Exception:
         return None
+
+
+def get_completed_subagent_runs(cfg: E2EConfig) -> set[str]:
+    """Find completed child runs in the current user's microVM log stream."""
+    user_id = get_user_id(cfg)
+    if not user_id:
+        raise RuntimeError("E2E user has no registered identity")
+    cf = boto3.client("cloudformation", region_name=cfg.region)
+    stack = cf.describe_stacks(StackName=cfg.agentcore_stack_name)["Stacks"][0]
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    runtime_id = outputs["RuntimeArn"].rsplit("/", 1)[1]
+    group = f"/aws/bedrock-agentcore/runtimes/{runtime_id}-DEFAULT"
+    logs = boto3.client("logs", region_name=cfg.region)
+    paginator = logs.get_paginator("filter_log_events")
+    since_ms = int((time.time() - 3600) * 1000)
+    init_events = []
+    for page in paginator.paginate(
+        logGroupName=group, startTime=since_ms, filterPattern=f'"Init for user={user_id}"',
+    ):
+        init_events.extend(page.get("events", []))
+    if not init_events:
+        raise RuntimeError("No current-user microVM initialization found in runtime logs")
+    stream = max(init_events, key=lambda event: event["timestamp"])["logStreamName"]
+    runs = set()
+    pattern = re.compile(r"Ignoring chat final for runId=(\S+) sessionKey=\S+:subagent:\S+ \(subagent\)")
+    for page in paginator.paginate(
+        logGroupName=group, logStreamNames=[stream], startTime=since_ms,
+        filterPattern='"Ignoring chat final"',
+    ):
+        for event in page.get("events", []):
+            match = pattern.search(event["message"])
+            if match:
+                runs.add(match.group(1))
+    return runs
 
     return None

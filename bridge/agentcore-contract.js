@@ -49,6 +49,8 @@ const {
   fetchGatewaySnapshot,
   streamGatewayEvents,
 } = require("./dashboard-gateway");
+const { createChatRunTracker } = require("./chat-run-filter");
+const { readBody } = require("./read-body");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -821,6 +823,14 @@ function buildLiteLLMProviderConfig({ env = process.env } = {}) {
       `LITELLM_SUBAGENT_MODEL_ID '${subagentModelId}' was not found in LITELLM_MODELS_JSON`,
     );
   }
+  const fallbackIds = String(env.LITELLM_FALLBACK_MODEL_IDS || "").trim()
+    ? parseRequiredJsonEnv(env.LITELLM_FALLBACK_MODEL_IDS, "LITELLM_FALLBACK_MODEL_IDS")
+    : [];
+  if (!Array.isArray(fallbackIds) ||
+      fallbackIds.some((id) => typeof id !== "string" || !modelIds.has(id)) ||
+      new Set(fallbackIds).size !== fallbackIds.length) {
+    throw new Error("LITELLM_FALLBACK_MODEL_IDS must be a JSON array of unique catalog model IDs");
+  }
 
   const provider = {
     baseUrl,
@@ -838,6 +848,7 @@ function buildLiteLLMProviderConfig({ env = process.env } = {}) {
     providers: { litellm: provider },
     primaryModelRef: `litellm/${primaryModelId}`,
     subagentModelRef: `litellm/${subagentModelId}`,
+    fallbackModelRefs: fallbackIds.map((id) => `litellm/${id}`),
     providerModelCount: models.length,
   };
 }
@@ -890,10 +901,16 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
   const managedAgentIds = getManagedAgentIds({ humanoidEnabled });
   const modelConfig = buildOpenClawModelConfig();
   logOpenClawModelConfig(modelConfig);
+  const modelWithFallbacks = (primary) => {
+    const fallbacks = (modelConfig.fallbackModelRefs || []).filter((ref) => ref !== primary);
+    return fallbacks.length ? { primary, fallbacks } : primary;
+  };
+  const mainModel = modelWithFallbacks(modelConfig.primaryModelRef);
+  const subagentModel = modelWithFallbacks(modelConfig.subagentModelRef);
   const mainAgent = {
     id: "main",
     name: "Main",
-    model: modelConfig.primaryModelRef,
+    model: mainModel,
     identity: { name: "Main" },
     workspace: mainWorkspaceDir,
   };
@@ -905,7 +922,7 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
   const domainCommentatorAgent = {
     id: DOMAIN_COMMENTATOR_AGENT_ID,
     name: "Domain Arena Commentator",
-    model: modelConfig.subagentModelRef,
+    model: subagentModel,
     identity: { name: "Domain Arena Commentator" },
     workspace: buildAgentWorkspaceDir(homeDir, DOMAIN_COMMENTATOR_AGENT_ID),
     tools: {
@@ -930,7 +947,7 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
   const communicationManagerAgent = {
     id: COMMUNICATION_MANAGER_AGENT_ID,
     name: "communication-manager",
-    model: modelConfig.subagentModelRef,
+    model: subagentModel,
     skills: ["digital_human"],
     identity: { name: "communication-manager" },
     workspace: buildAgentWorkspaceDir(homeDir, COMMUNICATION_MANAGER_AGENT_ID),
@@ -953,7 +970,7 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
     ? HUMANOID_ROBOT_IDS.map((robotId, index) => ({
       id: robotId,
       name: `Robot ${index + 1}`,
-      model: modelConfig.subagentModelRef,
+      model: subagentModel,
       skills: ["humanoid"],
       identity: { name: `Robot ${index + 1}` },
       workspace: buildAgentWorkspaceDir(homeDir, robotId),
@@ -987,7 +1004,7 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
     agents: {
       ownership: "explicit",
       defaults: {
-        model: { primary: modelConfig.primaryModelRef },
+        model: typeof mainModel === "string" ? { primary: mainModel } : mainModel,
         modelPolicy: {
           allow: Object.entries(modelConfig.providers).flatMap(([providerId, provider]) =>
             provider.models.map((model) => `${providerId}/${model.id}`),
@@ -997,7 +1014,7 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
         heartbeat: { agentId: MAIN_AGENT_ID },
         workspace: mainWorkspaceDir,
         subagents: {
-          model: modelConfig.subagentModelRef,
+          model: subagentModel,
           maxConcurrent: 2,
           runTimeoutSeconds: 900,
           archiveAfterMinutes: 60,
@@ -1434,6 +1451,8 @@ async function init(userId, actorId, channel) {
         NODE_OPTIONS: process.env.NODE_OPTIONS || "",
         AWS_REGION: process.env.AWS_REGION || "us-west-2",
         BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "",
+        BEDROCK_GUARDRAIL_ID: process.env.BEDROCK_GUARDRAIL_ID || "",
+        BEDROCK_GUARDRAIL_VERSION: process.env.BEDROCK_GUARDRAIL_VERSION || "DRAFT",
         COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
         COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
         COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
@@ -1783,26 +1802,94 @@ function createTelegramStreamer(chatId) {
     startTypingLoop();
   };
 
-  const finalize = async (text) => {
+  const finalize = async (text, { callerGone = false } = {}) => {
     stopTypingLoop();
-    if (!text) return { messageId: null };
-    try {
-      const resp = await telegramApiCall("sendMessage", {
-        chat_id: chatId,
-        text,
-      });
-      const messageId = resp.ok ? resp.result?.message_id : null;
-      if (messageId) {
-        console.log(`[telegram-stream] Final message sent: msg_id=${messageId}`);
+    if (!callerGone || !text || !text.trim()) return { messageId: null };
+
+    const chunks = splitTelegramText(text);
+    let lastMessageId = null;
+    let delivered = 0;
+    for (const chunk of chunks) {
+      try {
+        const response = await telegramApiCall("sendMessage", {
+          chat_id: chatId,
+          text: chunk,
+        });
+        if (response?.ok) {
+          delivered++;
+          lastMessageId = response.result?.message_id || lastMessageId;
+        } else {
+          console.warn(
+            `[telegram-stream] Orphaned reply chunk rejected: ${response?.description || "unknown error"}`,
+          );
+        }
+      } catch (err) {
+        console.warn(`[telegram-stream] Orphaned reply chunk error: ${err.message}`);
       }
-      return { messageId };
-    } catch (err) {
-      console.warn(`[telegram-stream] Final send error: ${err.message}`);
-      return { messageId: null };
     }
+    console.warn(
+      `[telegram-stream] Caller disconnected; sent ${delivered}/${chunks.length} reply chunk(s) for chat_id=${chatId}`,
+    );
+    return { messageId: delivered === chunks.length ? lastMessageId : null };
   };
 
   return { onDelta, finalize };
+}
+
+const TELEGRAM_CHUNK_UTF16_UNITS = 4000;
+
+function splitTelegramText(text, limit = TELEGRAM_CHUNK_UTF16_UNITS) {
+  const chunks = [];
+  let rest = text || "";
+  while (rest) {
+    if (rest.length <= limit) {
+      chunks.push(rest);
+      break;
+    }
+
+    let fit = limit;
+    const lastCodeUnit = rest.charCodeAt(fit - 1);
+    if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) fit--;
+    const window = rest.slice(0, fit);
+    const fences = [...window.matchAll(/```/g)].map((match) => match.index);
+    const floor = Math.floor(fit / 2);
+    const outsideFence = (cut) =>
+      fences.filter((fence) => fence + 3 <= cut).length % 2 === 0;
+    let cut = fit;
+    let found = false;
+
+    for (const requireFenceBalance of [true, false]) {
+      for (const separator of ["\n\n", "\n", " "]) {
+        let pos = window.lastIndexOf(separator);
+        while (pos >= floor) {
+          const candidate = pos + separator.length;
+          if (!requireFenceBalance || outsideFence(candidate)) {
+            cut = candidate;
+            found = true;
+            break;
+          }
+          pos = window.lastIndexOf(separator, pos - 1);
+        }
+        if (found) break;
+      }
+      if (found) break;
+    }
+
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  return chunks;
+}
+
+function trackCallerDisconnect(res) {
+  let gone = false;
+  res.on("close", () => {
+    if (!res.writableFinished) gone = true;
+  });
+  return () =>
+    gone ||
+    (!res.writableFinished &&
+      (res.destroyed || Boolean(res.socket && res.socket.destroyed)));
 }
 
 /**
@@ -1885,6 +1972,7 @@ async function bridgeMessage(
     let resolved = false;
     let connectReqId = null;
     let chatReqId = null;
+    let chatRun = null;
     let unhandledMsgs = [];
 
     const done = (text) => {
@@ -2010,6 +2098,7 @@ async function bridgeMessage(
           "[contract] Authenticated successfully, sending chat.send...",
         );
         chatReqId = randomUUID();
+        chatRun = createChatRunTracker(chatReqId);
         const constructedSessionKey = agentId ? 
           ((actorId && channel) ? `agent:${agentId}:${channel}:${actorId.replace(/:/g, "_")}` : "agent:" + agentId) : 
           "global";
@@ -2045,6 +2134,28 @@ async function bridgeMessage(
       // directly in payload.message (string or content-blocks array).
       if (msg.type === "event" && msg.event === "chat") {
         const payload = msg.payload || {};
+
+        if (chatRun) {
+          const verdict = chatRun.classify(payload);
+          if (verdict.action === "ignore") {
+            console.log(
+              "[contract] Ignoring chat %s for runId=%s sessionKey=%s (%s)",
+              payload.state,
+              payload.runId,
+              payload.sessionKey,
+              verdict.reason,
+            );
+            return;
+          }
+          if (verdict.action === "yield") {
+            console.log(
+              "[contract] Run %s yielded; waiting for its successor in %s",
+              payload.runId,
+              payload.sessionKey,
+            );
+            return;
+          }
+        }
 
         if (payload.state === "delta") {
           const text = extractFromPayload(payload);
@@ -2101,6 +2212,7 @@ async function bridgeMessage(
           );
           return;
         }
+        if (chatRun) chatRun.adoptAck(msg.payload);
         // Log full payload for debugging
         const status = msg.payload?.status;
         console.log(
@@ -2200,22 +2312,8 @@ const server = http.createServer(async (req, res) => {
 
   // POST /invocations — Chat handler
   if (req.method === "POST" && req.url === "/invocations") {
-    let body = "";
-    let bodySize = 0;
-    let aborted = false;
-    req.on("data", (chunk) => {
-      bodySize += chunk.length;
-      if (bodySize > MAX_BODY_SIZE) {
-        aborted = true;
-        res.writeHead(413, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Request body too large" }));
-        req.destroy();
-        return;
-      }
-      body += chunk;
-    });
-    req.on("end", async () => {
-      if (aborted) return;
+    const callerGone = trackCallerDisconnect(res);
+    readBody(req, MAX_BODY_SIZE).then(async (body) => {
       try {
         const payload = body ? JSON.parse(body) : {};
         const action = payload.action || "status";
@@ -2686,9 +2784,11 @@ const server = http.createServer(async (req, res) => {
 
           // Finalize Telegram streaming (final edit without "..." suffix)
           let telegramStreamed = false;
-          if (telegramStreamer && responseText) {
+          if (telegramStreamer) {
             try {
-              const result = await telegramStreamer.finalize(responseText);
+              const result = await telegramStreamer.finalize(responseText, {
+                callerGone: callerGone(),
+              });
               if (result.messageId) {
                 telegramStreamed = true;
                 console.log(
@@ -2702,15 +2802,17 @@ const server = http.createServer(async (req, res) => {
             }
           }
 
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              response: responseText,
-              userId: currentUserId,
-              sessionId: payload.sessionId || null,
-              streamed: telegramStreamed || undefined,
-            }),
-          );
+          if (!callerGone()) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                response: responseText,
+                userId: currentUserId,
+                sessionId: payload.sessionId || null,
+                streamed: telegramStreamed || undefined,
+              }),
+            );
+          }
           return;
         }
 
@@ -2723,12 +2825,27 @@ const server = http.createServer(async (req, res) => {
         console.error("[contract] Invocation error:", err.message, err.stack);
         // Return 200 with generic error — AgentCore treats 500 as infrastructure failure.
         // Never expose stack traces or internal details to callers.
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            response: "An internal error occurred. Please try again.",
-          }),
-        );
+        if (!callerGone()) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              response: "An internal error occurred. Please try again.",
+            }),
+          );
+        }
+      }
+    }).catch((err) => {
+      if (err.code === "BODY_TOO_LARGE") {
+        if (!callerGone()) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Request body too large" }));
+        }
+        return;
+      }
+      if (!callerGone()) {
+        console.error(`[contract] Request body read failed: ${err.message}`);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid request body" }));
       }
     });
     return;
@@ -2940,6 +3057,9 @@ if (process.env.NODE_ENV !== "test") {
     buildLiteLLMProviderConfig,
     buildAgentCoreProvider,
     normalizeModelCatalog,
+    createTelegramStreamer,
+    splitTelegramText,
+    trackCallerDisconnect,
     writeOpenClawConfig,
     stopOpenClawProcess,
     migrateOpenClawWorkspace,

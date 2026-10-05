@@ -14,6 +14,8 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const net = require("net");
+const dns = require("dns");
 const { execFile, spawn } = require("child_process");
 
 const PROXY_PORT = 18790;
@@ -491,6 +493,26 @@ const BLOCKED_IP_PATTERNS = [
   /^::ffff:0\./i, // IPv4-mapped 0.0.0.0/8
 ];
 
+const BLOCKED_ADDRESSES = new net.BlockList();
+for (const [address, prefix] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10],
+  ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12],
+  ["192.168.0.0", 16],
+]) {
+  BLOCKED_ADDRESSES.addSubnet(address, prefix, "ipv4");
+  BLOCKED_ADDRESSES.addSubnet(`::ffff:${address}`, 96 + prefix, "ipv6");
+}
+BLOCKED_ADDRESSES.addAddress("::", "ipv6");
+BLOCKED_ADDRESSES.addAddress("::1", "ipv6");
+BLOCKED_ADDRESSES.addSubnet("64:ff9b::", 96, "ipv6");
+BLOCKED_ADDRESSES.addSubnet("fc00::", 7, "ipv6");
+BLOCKED_ADDRESSES.addSubnet("fe80::", 10, "ipv6");
+
+function isBlockedAddress(address) {
+  const family = net.isIP(address);
+  return family ? BLOCKED_ADDRESSES.check(address, family === 4 ? "ipv4" : "ipv6") : false;
+}
+
 const BLOCKED_HOSTNAMES = new Set([
   "localhost",
   "metadata.google.internal",
@@ -530,7 +552,17 @@ function validateUrlSafety(urlStr) {
     }
   }
 
+  // IP literals bypass DNS lookup; URL normalizes and brackets IPv6 literals.
+  if (isBlockedAddress(hostname.replace(/^\[|\]$/g, ""))) {
+    return `Blocked IP address: ${hostname}`;
+  }
   return null; // safe
+}
+
+function decodeChunks(chunks) {
+  return Buffer.concat(chunks.map((chunk) =>
+    Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8"),
+  )).toString("utf8");
 }
 
 /**
@@ -628,25 +660,34 @@ const MAX_REDIRECTS = 3;
 const MAX_SEARCH_QUERY_LENGTH = 500;
 
 /**
- * Resolve hostname and validate resolved IPs against SSRF blocklist.
- * Mitigates DNS rebinding attacks by checking the resolved IP, not just the hostname.
- * Returns null if safe, or an error message if blocked.
+ * dns.lookup-compatible callback that validates every resolved address used
+ * by the actual socket connection, rather than performing a separate precheck.
  */
-async function validateResolvedIps(hostname) {
-  const dns = require("dns").promises;
-  try {
-    const addresses = await dns.lookup(hostname, { all: true });
+function guardedLookup(hostname, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  const opts = typeof options === "number" ? { family: options } : { ...options };
+  // Resolve at connection time, checking every candidate before passing any
+  // address to the socket (including autoSelectFamily's all:true form).
+  dns.lookup(hostname, { ...opts, all: true }, (err, addresses) => {
+    if (err) return callback(err);
     for (const addr of addresses) {
-      for (const pattern of BLOCKED_IP_PATTERNS) {
-        if (pattern.test(addr.address)) {
-          return `Blocked resolved IP: ${addr.address} for hostname ${hostname}`;
-        }
+      if (isBlockedAddress(addr.address)) {
+        const blocked = new Error(`Blocked resolved IP: ${addr.address} for hostname ${hostname}`);
+        blocked.code = "EBLOCKEDADDR";
+        return callback(blocked);
       }
     }
-  } catch (err) {
-    return `DNS resolution failed: ${err.message}`;
-  }
-  return null; // safe
+    if (addresses.length === 0) {
+      const none = new Error(`DNS resolution failed: no addresses for ${hostname}`);
+      none.code = "ENOTFOUND";
+      return callback(none);
+    }
+    if (opts.all) callback(null, addresses);
+    else callback(null, addresses[0].address, addresses[0].family);
+  });
 }
 
 /**
@@ -664,19 +705,13 @@ async function executeWebFetch(url, depth = 0) {
     return `Error: ${validationError}`;
   }
 
-  // DNS rebinding mitigation: resolve and validate IPs before connecting
-  const parsed = new URL(url);
-  const ipError = await validateResolvedIps(parsed.hostname);
-  if (ipError) {
-    return `Error: ${ipError}`;
-  }
-
   return new Promise((resolve) => {
     const protocol = url.startsWith("https") ? https : http;
     const req = protocol.get(
       url,
       {
         timeout: WEB_FETCH_TIMEOUT_MS,
+        lookup: guardedLookup,
         headers: {
           "User-Agent":
             "Mozilla/5.0 (compatible; OpenClawBot/1.0; +https://github.com/aws-samples)",
@@ -696,16 +731,8 @@ async function executeWebFetch(url, depth = 0) {
             resolve(`Error: Redirect blocked — ${redirectError}`);
             return;
           }
-          // DNS rebinding mitigation: validate resolved IPs on redirect targets
-          const redirectParsed = new URL(redirectUrl);
           res.resume();
-          validateResolvedIps(redirectParsed.hostname).then((ipError) => {
-            if (ipError) {
-              resolve(`Error: Redirect blocked — ${ipError}`);
-              return;
-            }
-            resolve(executeWebFetch(redirectUrl, depth + 1));
-          });
+          resolve(executeWebFetch(redirectUrl, depth + 1));
           return;
         }
 
@@ -715,7 +742,7 @@ async function executeWebFetch(url, depth = 0) {
           return;
         }
 
-        let data = "";
+        const chunks = [];
         let bytes = 0;
         let resolved = false;
         res.on("data", (chunk) => {
@@ -724,7 +751,7 @@ async function executeWebFetch(url, depth = 0) {
             // Resolve immediately with collected data before destroying
             if (!resolved) {
               resolved = true;
-              const text = stripHtml(data);
+              const text = stripHtml(decodeChunks(chunks));
               resolve(
                 (text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)") +
                   "\n\n[Content truncated at size limit]",
@@ -733,12 +760,12 @@ async function executeWebFetch(url, depth = 0) {
             res.destroy();
             return;
           }
-          data += chunk;
+          chunks.push(chunk);
         });
         res.on("end", () => {
           if (!resolved) {
             resolved = true;
-            const text = stripHtml(data);
+            const text = stripHtml(decodeChunks(chunks));
             resolve(text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)");
           }
         });
@@ -791,7 +818,7 @@ async function executeWebSearch(query) {
           return;
         }
 
-        let data = "";
+        const chunks = [];
         let bytes = 0;
         let resolved = false;
         res.on("data", (chunk) => {
@@ -800,17 +827,17 @@ async function executeWebSearch(query) {
             // Resolve with what we have before destroying the stream
             if (!resolved) {
               resolved = true;
-              resolve(parseSearchResults(data));
+              resolve(parseSearchResults(decodeChunks(chunks)));
             }
             res.destroy();
             return;
           }
-          data += chunk;
+          chunks.push(chunk);
         });
         res.on("end", () => {
           if (!resolved) {
             resolved = true;
-            resolve(parseSearchResults(data));
+            resolve(parseSearchResults(decodeChunks(chunks)));
           }
         });
         res.on("error", (err) => {
@@ -955,12 +982,23 @@ function getApiKeysPath() {
  */
 function readApiKeys() {
   const filePath = getApiKeysPath();
+  let raw;
   try {
-    const data = fs.readFileSync(filePath, "utf-8");
-    return JSON.parse(data);
-  } catch {
-    return {};
+    raw = fs.readFileSync(filePath, "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT") return {};
+    throw new Error(`native key file is unreadable (${err.code || err.name}); not modified.`);
   }
+  let keys;
+  try {
+    keys = JSON.parse(raw);
+  } catch {
+    keys = undefined;
+  }
+  if (!keys || typeof keys !== "object" || Array.isArray(keys)) {
+    throw new Error("native key file is not a valid JSON object; not modified.");
+  }
+  return keys;
 }
 
 /**
@@ -979,6 +1017,14 @@ function writeApiKeys(keys) {
  * Execute the manage_api_key tool (native file-based storage).
  */
 function executeManageApiKey(args) {
+  try {
+    return manageNativeApiKey(args);
+  } catch (err) {
+    return `Error: ${err.message}`;
+  }
+}
+
+function manageNativeApiKey(args) {
   const { action, key_name, key_value } = args;
 
   if (action === "list") {
@@ -1006,6 +1052,9 @@ function executeManageApiKey(args) {
   if (action === "get") {
     const keys = readApiKeys();
     if (!(key_name in keys)) return `Error: No API key found with name '${key_name}'.`;
+    if (typeof keys[key_name] !== "string" || keys[key_name] === "") {
+      return `Error: Native key '${key_name}' has no string value; not modified.`;
+    }
     return keys[key_name];
   }
 
@@ -1047,6 +1096,11 @@ function getSmClient() {
   return _smClient;
 }
 
+function _setSecretsManagerForTests(client, sdk) {
+  _smClient = client || null;
+  _smSdk = sdk || null;
+}
+
 // In-memory cache for secrets during session (cleared on SIGTERM)
 const _secretsCache = new Map();
 const MAX_SECRETS_PER_USER = 10;
@@ -1057,6 +1111,55 @@ const SECRET_PREFIX = "openclaw/user/";
  */
 function buildSecretName(namespace, keyName) {
   return `${SECRET_PREFIX}${namespace}/${keyName}`;
+}
+
+// Keep success separate from tool output text so migrations never remove a
+// source key after an SDK write error with a different "Error ..." prefix.
+async function setSecretValue(namespace, key_name, key_value) {
+  if (typeof key_value !== "string" || !key_value) {
+    return { ok: false, message: "Error: key_value is required for 'set' action." };
+  }
+  const sdk = getSmSdk();
+  const client = getSmClient();
+  const secretName = buildSecretName(namespace, key_name);
+  try {
+    await client.send(new sdk.PutSecretValueCommand({
+      SecretId: secretName,
+      SecretString: key_value,
+    }));
+    _secretsCache.set(secretName, key_value);
+    return { ok: true, message: `Secret '${key_name}' updated (Secrets Manager, KMS-encrypted).` };
+  } catch (err) {
+    if (err.name !== "ResourceNotFoundException") {
+      return { ok: false, message: `Error updating secret: ${err.message}` };
+    }
+    try {
+      const prefix = `${SECRET_PREFIX}${namespace}/`;
+      const listResp = await client.send(new sdk.ListSecretsCommand({
+        Filters: [{ Key: "name", Values: [prefix] }],
+        MaxResults: 100,
+      }));
+      if ((listResp.SecretList || []).length >= MAX_SECRETS_PER_USER) {
+        return { ok: false, message: `Error: Maximum ${MAX_SECRETS_PER_USER} secrets per user reached. Delete an existing secret first.` };
+      }
+    } catch {
+      // Preserve existing behavior: let the create attempt enforce service limits.
+    }
+    try {
+      await client.send(new sdk.CreateSecretCommand({
+        Name: secretName,
+        SecretString: key_value,
+        Tags: [
+          { Key: "openclaw:user", Value: namespace },
+          { Key: "openclaw:managed", Value: "true" },
+        ],
+      }));
+      _secretsCache.set(secretName, key_value);
+      return { ok: true, message: `Secret '${key_name}' saved (Secrets Manager, KMS-encrypted, auditable via CloudTrail).` };
+    } catch (err) {
+      return { ok: false, message: `Error creating secret: ${err.message}` };
+    }
+  }
 }
 
 /**
@@ -1101,48 +1204,7 @@ async function executeManageSecret(args, namespace) {
   const secretName = buildSecretName(namespace, key_name);
 
   if (action === "set") {
-    try {
-      // Try to update existing secret first
-      await client.send(new sdk.PutSecretValueCommand({
-        SecretId: secretName,
-        SecretString: key_value,
-      }));
-      _secretsCache.set(secretName, key_value);
-      return `Secret '${key_name}' updated (Secrets Manager, KMS-encrypted).`;
-    } catch (err) {
-      if (err.name === "ResourceNotFoundException") {
-        // Check max secrets limit before creating
-        try {
-          const prefix = `${SECRET_PREFIX}${namespace}/`;
-          const listResp = await client.send(new sdk.ListSecretsCommand({
-            Filters: [{ Key: "name", Values: [prefix] }],
-            MaxResults: 100,
-          }));
-          if ((listResp.SecretList || []).length >= MAX_SECRETS_PER_USER) {
-            return `Error: Maximum ${MAX_SECRETS_PER_USER} secrets per user reached. Delete an existing secret first.`;
-          }
-        } catch {
-          // Continue with create attempt — worst case it fails at service limit
-        }
-
-        // Create new secret
-        try {
-          await client.send(new sdk.CreateSecretCommand({
-            Name: secretName,
-            SecretString: key_value,
-            Tags: [
-              { Key: "openclaw:user", Value: namespace },
-              { Key: "openclaw:managed", Value: "true" },
-            ],
-          }));
-          _secretsCache.set(secretName, key_value);
-          return `Secret '${key_name}' saved (Secrets Manager, KMS-encrypted, auditable via CloudTrail).`;
-        } catch (createErr) {
-          return `Error creating secret: ${createErr.message}`;
-        }
-      }
-      return `Error updating secret: ${err.message}`;
-    }
+    return (await setSecretValue(namespace, key_name, key_value)).message;
   }
 
   if (action === "get") {
@@ -1155,6 +1217,9 @@ async function executeManageSecret(args, namespace) {
         SecretId: secretName,
       }));
       const value = resp.SecretString;
+      if (typeof value !== "string" || value === "") {
+        return `Error retrieving secret: Secret '${key_name}' has no string value.`;
+      }
       _secretsCache.set(secretName, value);
       return value;
     } catch (err) {
@@ -1204,7 +1269,7 @@ async function executeRetrieveApiKey(args, namespace) {
   // Try Secrets Manager first (secure mode)
   try {
     const smResult = await executeManageSecret({ action: "get", key_name }, namespace);
-    if (!smResult.startsWith("Error:")) {
+    if (!smResult.startsWith("Error:") && !smResult.startsWith("Error retrieving secret:")) {
       return smResult;
     }
   } catch {
@@ -1236,28 +1301,43 @@ async function executeMigrateApiKey(args, namespace) {
     // Read from native
     const value = executeManageApiKey({ action: "get", key_name });
     if (value.startsWith("Error:")) {
-      return `Error: Key '${key_name}' not found in native storage.`;
+      return value.startsWith("Error: No API key found")
+        ? `Error: Key '${key_name}' not found in native storage.`
+        : value;
     }
     // Write to Secrets Manager
-    const setResult = await executeManageSecret({ action: "set", key_name, key_value: value }, namespace);
-    if (setResult.startsWith("Error:")) {
-      return setResult;
+    const setResult = await setSecretValue(namespace, key_name, value);
+    if (!setResult.ok) {
+      return setResult.message;
     }
     // Delete from native
-    executeManageApiKey({ action: "delete", key_name });
+    const deleteResult = executeManageApiKey({ action: "delete", key_name });
+    if (deleteResult.startsWith("Error:")) {
+      return `Error: Key copied to Secrets Manager, but native source was not deleted: ${deleteResult}`;
+    }
     return `Migrated '${key_name}' from native file storage to Secrets Manager.`;
   }
 
   if (direction === "secure-to-native") {
     // Read from Secrets Manager
     const value = await executeManageSecret({ action: "get", key_name }, namespace);
+    if (typeof value !== "string" || value === "") {
+      return `Error: Secret '${key_name}' has no string value; nothing migrated.`;
+    }
     if (value.startsWith("Error:")) {
       return `Error: Key '${key_name}' not found in Secrets Manager.`;
     }
+    if (value.startsWith("Error retrieving secret:")) {
+      return `Error: Could not read key '${key_name}' from Secrets Manager: ${value.slice("Error retrieving secret:".length).trim()}`;
+    }
     // Write to native
-    executeManageApiKey({ action: "set", key_name, key_value: value });
+    const nativeResult = executeManageApiKey({ action: "set", key_name, key_value: value });
+    if (nativeResult.startsWith("Error:")) return nativeResult;
     // Delete from Secrets Manager
-    await executeManageSecret({ action: "delete", key_name }, namespace);
+    const deleteResult = await executeManageSecret({ action: "delete", key_name }, namespace);
+    if (!deleteResult.startsWith(`Secret '${key_name}' scheduled for deletion`)) {
+      return `Error: Key copied to native storage, but Secrets Manager source was not deleted: ${deleteResult}`;
+    }
     return `Migrated '${key_name}' from Secrets Manager to native file storage.`;
   }
 
@@ -1347,11 +1427,12 @@ function callProxy(messages) {
         timeout: HTTP_TIMEOUT_MS,
       },
       (res) => {
-        let body = "";
-        res.on("data", (chunk) => (body += chunk));
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("error", reject);
         res.on("end", () => {
           try {
-            const parsed = JSON.parse(body);
+            const parsed = JSON.parse(decodeChunks(chunks));
             resolve(parsed);
           } catch (e) {
             reject(new Error(`Proxy response parse error: ${e.message}`));
@@ -1482,4 +1563,6 @@ module.exports = {
   executeRetrieveApiKey,
   executeMigrateApiKey,
   SM_REQUEST_TIMEOUT_MS,
+  _guardedLookup: guardedLookup,
+  _setSecretsManagerForTests,
 };

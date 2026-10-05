@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import time
+import uuid
 
 import boto3
 from botocore.exceptions import ClientError
@@ -34,7 +35,7 @@ import pytest
 from .config import load_config
 from .conftest import SCENARIOS
 from .log_tailer import tail_logs
-from .session import get_agent_status, get_session_id, get_user_id, reset_session, reset_user
+from .session import get_agent_status, get_completed_subagent_runs, get_session_id, get_user_id, reset_session, reset_user
 from .webhook import health_check, post_webhook
 
 
@@ -106,8 +107,8 @@ class TestMessageLifecycle:
 class TestTelegramFormatting:
     """Verify Telegram responses don't leak raw JSON or markdown table syntax.
 
-    These are E2E smoke tests that send real webhooks and inspect the response
-    text captured from CloudWatch logs.
+    These tests inspect metadata computed from the rendered reply and Telegram's
+    delivery acknowledgement, without copying reply contents into logs.
     """
 
     def test_no_raw_json_content_blocks(self, e2e_config):
@@ -122,13 +123,7 @@ class TestTelegramFormatting:
         )
         assert tail.response_len > 0, "Response was empty"
 
-        resp = tail.response_text
-        assert '[{"type":"text"' not in resp, (
-            f"Raw JSON content-block wrapper leaked to user:\n{resp[:500]}"
-        )
-        assert '{"type": "text"' not in resp, (
-            f"Raw JSON content-block wrapper (spaced) leaked to user:\n{resp[:500]}"
-        )
+        assert tail.content_blocks is False, "Raw content-block wrapper detected or metadata missing"
 
     def test_no_markdown_tables_in_response(self, e2e_config):
         """Response text should not contain markdown table separators."""
@@ -145,10 +140,9 @@ class TestTelegramFormatting:
         )
         assert tail.response_len > 0, "Response was empty"
 
-        resp = tail.response_text
-        assert "|---" not in resp, (
-            f"Markdown table separators leaked to user:\n{resp[:500]}"
-        )
+        assert tail.delivered_chunks > 0, "No Telegram delivery acknowledgement observed"
+        assert not tail.plain_text_fallback, "Telegram rejected HTML and used plain-text fallback"
+        assert tail.markdown_table is False, "Markdown table detected or metadata missing"
 
     def test_response_is_plain_text_or_html(self, e2e_config):
         """Response should be plain text or Telegram HTML, not raw JSON."""
@@ -162,13 +156,8 @@ class TestTelegramFormatting:
         )
         assert tail.response_len > 0, "Response was empty"
 
-        resp = tail.response_text.lstrip()
-        assert not resp.startswith("[{"), (
-            f"Response starts with raw JSON array:\n{resp[:500]}"
-        )
-        assert "|---|" not in resp, (
-            f"Markdown table separators in response:\n{resp[:500]}"
-        )
+        assert tail.json_array is False, "Raw JSON array detected or metadata missing"
+        assert tail.markdown_table is False, "Markdown table detected or metadata missing"
 
 
 class TestColdStart:
@@ -223,11 +212,10 @@ class TestWarmupShim:
         )
 
         # The shim appends a deterministic footer about warm-up mode
-        resp_lower = tail.response_text.lower()
-        assert self.SHIM_FOOTER in resp_lower, (
+        assert tail.is_warmup, (
             f"Expected shim warm-up footer in response.\n"
             f"Looked for: {self.SHIM_FOOTER!r}\n"
-            f"Response ({tail.response_len} chars): {tail.response_text[:300]}"
+            f"Response length: {tail.response_len}"
         )
 
 
@@ -279,7 +267,7 @@ class TestFullStartup:
         assert tail.is_warmup, (
             f"Expected warm-up shim response on cold start, but got full "
             f"OpenClaw response in {warmup_response_s:.1f}s. "
-            f"Response: {tail.response_text[:200]}"
+            f"Response length: {tail.response_len}"
         )
 
         # --- Phase 2: Poll until OpenClaw is fully started ---
@@ -303,7 +291,7 @@ class TestFullStartup:
             if not tail.full_lifecycle:
                 continue
 
-            last_response = tail.response_text
+            last_response = f"{tail.response_len} characters delivered"
             if not tail.is_warmup:
                 fully_up = True
                 full_startup_s = time.monotonic() - cold_start_mono
@@ -370,9 +358,8 @@ class TestSubagent:
     sub-agents for parallel work. Requires OpenClaw to be fully started
     (not in warm-up mode).
 
-    After each skill invocation, queries the contract status endpoint to
-    verify that subagentRequestCount increased — definitive proof that
-    OpenClaw subagents actually fired (not just that the skill responded).
+    After each invocation, checks completed child-run IDs in the current user's
+    runtime logs, including when LiteLLM bypasses the Bedrock proxy.
 
     These tests are slower than other E2E tests because:
     1. They may need to wait for full OpenClaw startup (~1-2 min)
@@ -395,14 +382,8 @@ class TestSubagent:
 
     @staticmethod
     def _get_subagent_count(e2e_config):
-        """Query contract status for current subagentRequestCount.
-
-        Returns the count, or None if the status endpoint is unavailable.
-        """
-        status = get_agent_status(e2e_config)
-        if status is None:
-            return None
-        return status.get("subagentRequestCount")
+        """Count completed child runs independently of model provider."""
+        return len(get_completed_subagent_runs(e2e_config))
 
     def test_task_delegation(self, e2e_config):
         """Send a task decomposition request and verify structured output.
@@ -417,8 +398,10 @@ class TestSubagent:
         since_ms = int(time.time() * 1000)
         result = post_webhook(
             e2e_config,
-            "Use your built-in sub-agent tools to delegate planning a REST API "
-            "to sub-agents, then synthesize their subtasks.",
+            f"New independent E2E run {uuid.uuid4().hex}: use your built-in "
+            "sub-agent tools to spawn fresh sub-agents to plan a REST API, "
+            "then wait for them and synthesize their subtasks. Repeat the "
+            "delegation even if a similar plan already exists in history.",
         )
         assert result.status_code == 200
 
@@ -436,14 +419,14 @@ class TestSubagent:
         assert tail.response_len >= self.MIN_TASK_DECOMPOSE_LEN, (
             f"Response too short ({tail.response_len} chars) for task "
             f"decomposition. Expected structured subtask output.\n"
-            f"Response: {tail.response_text[:300]}"
+            f"Response length: {tail.response_len}"
         )
 
         # Verify subagent requests actually fired
         after_count = self._get_subagent_count(e2e_config)
         if baseline_count is not None and after_count is not None:
             assert after_count > baseline_count, (
-                f"subagentRequestCount did not increase after task delegation "
+                f"Completed child-run count did not increase after task delegation "
                 f"(before={baseline_count}, after={after_count}). "
                 f"Subagents may not have fired."
             )
@@ -459,7 +442,7 @@ class TestSubagent:
 
         print(
             f"  Task decomposer response ({tail.response_len} chars, "
-            f"{tail.elapsed_s:.1f}s): {tail.response_text[:300]}"
+            f"{tail.elapsed_s:.1f}s)"
         )
 
     def test_deep_research_skill(self, e2e_config):
@@ -494,14 +477,14 @@ class TestSubagent:
         assert tail.response_len >= self.MIN_DEEP_RESEARCH_LEN, (
             f"Response too short ({tail.response_len} chars) for deep "
             f"research. Expected multi-section research output.\n"
-            f"Response: {tail.response_text[:300]}"
+            f"Response length: {tail.response_len}"
         )
 
         # Verify subagent requests actually fired
         after_count = self._get_subagent_count(e2e_config)
         if baseline_count is not None and after_count is not None:
             assert after_count > baseline_count, (
-                f"subagentRequestCount did not increase after deep-research "
+                f"Completed child-run count did not increase after deep-research "
                 f"(before={baseline_count}, after={after_count}). "
                 f"Subagents may not have fired."
             )
@@ -517,7 +500,7 @@ class TestSubagent:
 
         print(
             f"  Deep research response ({tail.response_len} chars, "
-            f"{tail.elapsed_s:.1f}s): {tail.response_text[:300]}"
+            f"{tail.elapsed_s:.1f}s)"
         )
 
 
@@ -1808,9 +1791,7 @@ def _cli_send(cfg, text, tail, timeout_s=300):
             print(f"  New session: {tail_result.session_id}")
         if tail_result.new_user:
             print(f"  New user: {tail_result.user_id}")
-        if tail_result.response_text:
-            preview = tail_result.response_text[:200]
-            print(f"  Response ({tail_result.response_len} chars): {preview}")
+        print(f"  Response length: {tail_result.response_len} characters (content not logged)")
     else:
         print(f"  INCOMPLETE — elapsed={tail_result.elapsed_s:.1f}s timed_out={tail_result.timed_out}")
         print(f"    received={tail_result.message_received}")
