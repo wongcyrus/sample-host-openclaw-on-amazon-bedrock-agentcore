@@ -318,3 +318,30 @@ still log the configured LiteLLM endpoint URL in the access-controlled runtime
 CloudWatch log. The Router/cron response-preview fix does not redact these
 upstream transport messages. The actual endpoint and API key are not included
 in this documentation or committed configuration.
+
+## MCP configuration repair and native diagnostics
+
+The later dev rollout reached runtime version **17**. OpenClaw's native logs
+identified `missing-meta-vs-last-good`: the generated config lacked a `meta`
+object, so OpenClaw recovered its older accepted config and restored an obsolete
+MCP endpoint. A schema-valid `meta: {}` prevents that false recovery. Current
+MCP settings now reach the skill subprocess through the safe environment
+allowlist, and both skill launchers prefer current `HUMANOID_MCP_*` settings.
+
+CDK now reads MCP settings from the selected env file before falling back to
+legacy context and derives the exact IAM gateway ARN from AgentCore gateway
+URLs. The dev repair preserved production and existing networking.
+
+`scripts/debug-openclaw.py` retrieves bounded native file logs directly through
+an owner-checked diagnostic action, without involving a model. Its optional
+MCP check invokes only the humanoid skill's read-only signed `tools/list`.
+`scripts/follow-openclaw-logs.sh --env dev` polls those logs and reads the target
+Telegram user and region from the selected env file. See the
+[debugging runbook](openclaw-debugging.md) for commands, access requirements,
+private artifact handling, and tool/delegation troubleshooting.
+
+Fresh-session verification confirmed both saved skill endpoints matched the
+runtime and the actual skill connection returned HTTP 200 with 30 tools.
+Provider K3 HTTP 502 failures and invalid model delegation arguments remained
+separate issues; successful connectivity is not a claim that every robot
+request completes. The diagnostic tests did not issue robot movement commands.

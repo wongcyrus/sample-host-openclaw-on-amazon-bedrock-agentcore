@@ -50,6 +50,8 @@ const SYSTEM_PROMPT =
   "After full startup completes (~1-2 minutes), you gain additional capabilities: " +
   "rich Telegram formatting, " +
   "built-in sub-agent delegation, and enhanced web reading via Jina. " +
+  "Robot and digital-human skills require full OpenClaw startup. During warm-up, " +
+  "explicitly say those skills are not ready yet; never claim robots are unsupported or that an action ran. " +
   "Do not use markdown tables in responses — use bullet lists or plain paragraphs, as they render better in chat interfaces like Telegram and Slack.";
 
 const TOOLS = [
@@ -1501,7 +1503,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
         "I received your message but couldn't generate a response. Please try again.";
       const footer =
         "\n\n---\n" +
-        "_Warm-up mode — after full startup (~5-6 second), additional " +
+        "_Warm-up mode — full startup can take several minutes; additional " +
         "community skills come online: enhanced web reading, rich Telegram formatting, " +
         "etc. Built-in sub-agent delegation also becomes available._";
       return text + footer;
@@ -1535,7 +1537,7 @@ async function chat(userMessage, userId, deadlineMs = 0) {
   console.warn("[shim] Max iterations reached");
   const fallbackFooter =
     "\n\n---\n" +
-    "_Warm-up mode — after full startup (~5-6 second), additional " +
+    "_Warm-up mode — full startup can take several minutes; additional " +
     "community skills come online: enhanced web reading, rich Telegram formatting, " +
     "etc. Built-in sub-agent delegation also becomes available._";
   return "I ran into a limit processing your request. Please try rephrasing." + fallbackFooter;

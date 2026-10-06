@@ -93,6 +93,7 @@ RUN mkdir -p /root/.openclaw
 
 COPY bridge/agentcore-contract.js /app/agentcore-contract.js
 COPY bridge/read-body.js bridge/chat-run-filter.js /app/
+COPY bridge/runtime-diagnostics.js /app/
 COPY bridge/dashboard-gateway.js /app/dashboard-gateway.js
 COPY bridge/agentcore-proxy.js /app/agentcore-proxy.js
 COPY bridge/lightweight-agent.js /app/lightweight-agent.js

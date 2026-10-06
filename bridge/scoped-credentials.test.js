@@ -294,6 +294,18 @@ describe("buildSessionPolicy", () => {
 
 // --- createScopedCredentials ---
 
+it("forwards current humanoid settings without forwarding credentials", () => {
+  const { buildOpenClawEnv } = require("./scoped-credentials");
+  const env = buildOpenClawEnv({ credDir: "/tmp/test", baseEnv: {
+    HUMANOID_MCP_SERVER_URL: "https://current.invalid/mcp",
+    HUMANOID_MCP_AUTH_MODE: "iam",
+    AWS_SECRET_ACCESS_KEY: "must-not-forward",
+  } });
+  assert.equal(env.HUMANOID_MCP_SERVER_URL, "https://current.invalid/mcp");
+  assert.equal(env.HUMANOID_MCP_AUTH_MODE, "iam");
+  assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
+});
+
 describe("createScopedCredentials", () => {
   let createScopedCredentials, _mockStsClient;
 

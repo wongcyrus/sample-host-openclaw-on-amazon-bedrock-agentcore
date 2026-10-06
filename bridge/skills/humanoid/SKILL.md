@@ -23,6 +23,7 @@ cd {baseDir} && ./run.sh --robot-id robot_1 --sequence "wave,push_ups,bow" --wai
 cd {baseDir} && ./run.sh --robot-id robot_1 --speak "Hello, welcome" --language en --json
 cd {baseDir} && ./run.sh --robot-id robot_1 --action capture_image --json
 cd {baseDir} && ./run.sh --list-actions
+cd {baseDir} && ./run.sh --check-connection
 ```
 
 ## Supported Robots
@@ -34,6 +35,8 @@ cd {baseDir} && ./run.sh --list-actions
 - `HUMANOID_MCP_SERVER_URL` must be passed into the runtime deployment environment
 - `HUMANOID_MCP_AUTH_MODE` defaults to `iam`; set it to `api-key` only if the endpoint requires an API key instead of SigV4
 - AWS credentials are provided by the AgentCore runtime automatically
+- `--check-connection` performs a read-only signed `tools/list`; `--list-actions` is only a local catalog
+- Current `HUMANOID_MCP_*` environment settings take precedence over per-skill `MCP_*` defaults; explicit flags override both
 
 If you use API-key mode, provide the key to the skill process securely and avoid hardcoding it into source control.
 

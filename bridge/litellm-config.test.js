@@ -177,6 +177,7 @@ describe("OpenClaw model config", () => {
       assert.ok(Object.values(config.agents.entries).every((entry) => entry.id === undefined));
       assert.deepEqual(config.agents.defaults.systemAgent, { agentId: "main" });
       assert.deepEqual(config.agents.defaults.heartbeat, { agentId: "main" });
+      assert.deepEqual(config.meta, {});
       assert.deepEqual(config.agents.defaults.modelPolicy.allow, [
         "agentcore/bedrock-agentcore", "agentcore/bedrock-agentcore-subagent",
       ]);

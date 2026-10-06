@@ -48,6 +48,9 @@ const FORWARDED_ENV_KEYS = [
   // User identity — skills like agentcore-browser read USER_ID from env
   "USER_ID",
   "INTERNAL_USER_ID",
+  "HUMANOID_MCP_SERVER_URL",
+  "HUMANOID_MCP_AUTH_MODE",
+  "HUMANOID_MCP_API_KEY_HEADER",
 ];
 
 /**

@@ -100,6 +100,11 @@ Use it when the user wants a communications-focused filter or response drafter.
 
 The runtime exposes robot agents: robot_1 through robot_6.
 Do not control robots directly from the main workspace. Delegate physical work to the matching robot agent.
+Use `sessions_spawn` with the target `agentId` and a complete `task` for new work.
+`sessions_send` requires a `message` and is for an existing session, not a substitute
+for spawning a robot task. An announcement such as "spawning robot_1" is not
+execution: call the tool and report its actual result or explicit failure.
+Only report a robot action as completed after the specialist returns skill execution evidence.
 
 ## Heartbeats
 

@@ -51,6 +51,7 @@ const {
 } = require("./dashboard-gateway");
 const { createChatRunTracker } = require("./chat-run-filter");
 const { readBody } = require("./read-body");
+const { collectDiagnostics } = require("./runtime-diagnostics");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -998,6 +999,7 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
     : [];
 
   const config = {
+    meta: {},
     models: {
       providers: modelConfig.providers,
     },
@@ -2317,6 +2319,40 @@ const server = http.createServer(async (req, res) => {
       try {
         const payload = body ? JSON.parse(body) : {};
         const action = payload.action || "status";
+
+        if (action === "diagnostics") {
+          if (!currentUserId || payload.userId !== currentUserId) {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Diagnostics requires the initialized session owner" }));
+            return;
+          }
+          if (!openclawReady || !lastOpenClawEnv) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "OpenClaw is not ready for diagnostics" }));
+            return;
+          }
+          let diagnostics;
+          try {
+            diagnostics = await collectDiagnostics({
+              limit: payload.limit,
+              checkMcp: payload.checkMcp,
+              gatewayEnv: lastOpenClawEnv,
+            });
+          } catch (err) {
+            console.error(`[contract] Diagnostics failed: code=${err.code || "DIAGNOSTICS_FAILED"}`);
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Diagnostics failed; inspect runtime logs for the error code" }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            status: "ready",
+            buildVersion: BUILD_VERSION,
+            uptimeSeconds: Math.floor((Date.now() - startTime) / 1000),
+            ...diagnostics,
+          }));
+          return;
+        }
 
         // Status check (no init needed)
         if (action === "status") {

@@ -118,12 +118,12 @@ def main():
     )
     parser.add_argument(
         "--mcp-url",
-        default=os.environ.get("MCP_SERVER_URL", ""),
+        default=os.environ.get("HUMANOID_MCP_SERVER_URL") or os.environ.get("MCP_SERVER_URL", ""),
         help="MCP endpoint URL (or set MCP_SERVER_URL)",
     )
     parser.add_argument(
         "--auth-mode",
-        default=os.environ.get("MCP_AUTH_MODE", "iam"),
+        default=os.environ.get("HUMANOID_MCP_AUTH_MODE") or os.environ.get("MCP_AUTH_MODE", "iam"),
         help="MCP auth mode: iam, api-key, or none. Default: iam",
     )
     parser.add_argument(
@@ -133,7 +133,7 @@ def main():
     )
     parser.add_argument(
         "--api-key-header",
-        default=os.environ.get("MCP_API_KEY_HEADER", "x-api-key"),
+        default=os.environ.get("HUMANOID_MCP_API_KEY_HEADER") or os.environ.get("MCP_API_KEY_HEADER", "x-api-key"),
         help="Header name for --api-key. Default: x-api-key",
     )
     parser.add_argument(

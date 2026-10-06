@@ -26,6 +26,7 @@ import cdk_nag
 from constructs import Construct
 
 from stacks import DeploymentNamer, auto_delete_bucket_objects, stateful_removal_policy
+from stacks.mcp_config import resolve_mcp_config
 
 # Regions where AgentCore Browser (CfnBrowserCustom) is confirmed available.
 BROWSER_SUPPORTED_REGIONS = {"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-southeast-2"}
@@ -223,12 +224,11 @@ class AgentCoreStack(Stack):
             )
         )
 
-        humanoid_auth_mode = str(
-            self.node.try_get_context("humanoid_mcp_auth_mode") or "iam"
-        ).strip().lower()
-        humanoid_function_arn = str(
-            self.node.try_get_context("humanoid_mcp_function_arn") or ""
-        ).strip()
+        mcp_config = resolve_mcp_config(
+            os.environ, self.node.try_get_context, account=account, region=region,
+        )
+        humanoid_auth_mode = mcp_config["auth"]
+        humanoid_function_arn = mcp_config["arn"]
         if humanoid_auth_mode == "iam" and humanoid_function_arn:
             # Grant permission to invoke the Bedrock AgentCore Gateway.
             # If humanoid_function_arn is still configured as a legacy Lambda function ARN,
@@ -590,19 +590,13 @@ class AgentCoreStack(Stack):
             runtime_env["LITELLM_SUBAGENT_MODEL_ID"] = litellm_subagent_model_id
         if litellm_fallback_model_ids:
             runtime_env["LITELLM_FALLBACK_MODEL_IDS"] = litellm_fallback_model_ids
-        humanoid_mcp_url = str(
-            self.node.try_get_context("humanoid_mcp_server_url") or ""
-        ).strip()
+        humanoid_mcp_url = mcp_config["url"]
         if humanoid_mcp_url:
             runtime_env["HUMANOID_MCP_SERVER_URL"] = humanoid_mcp_url
-        humanoid_mcp_auth_mode = str(
-            self.node.try_get_context("humanoid_mcp_auth_mode") or ""
-        ).strip()
+        humanoid_mcp_auth_mode = mcp_config["auth"]
         if humanoid_mcp_auth_mode:
             runtime_env["HUMANOID_MCP_AUTH_MODE"] = humanoid_mcp_auth_mode
-        humanoid_mcp_api_key_header = str(
-            self.node.try_get_context("humanoid_mcp_api_key_header") or ""
-        ).strip()
+        humanoid_mcp_api_key_header = mcp_config["api_key_header"]
         if humanoid_mcp_api_key_header:
             runtime_env["HUMANOID_MCP_API_KEY_HEADER"] = humanoid_mcp_api_key_header
         if self.browser_id:

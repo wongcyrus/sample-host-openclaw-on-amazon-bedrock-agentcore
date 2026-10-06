@@ -102,6 +102,30 @@ def build_headers(api_key_header, api_key):
     return headers
 
 
+def check_connection(mcp_url, auth, headers):
+    """List gateway tools without executing robot actions."""
+    import requests
+
+    try:
+        response = requests.post(
+            mcp_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            auth=auth, headers=headers, timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("MCP tools/list failed (%s)", type(exc).__name__)
+        return False
+    tools = result.get("result", {}).get("tools")
+    if "error" in result or not isinstance(tools, list) or not tools:
+        logger.error("MCP tools/list returned an error or no tools")
+        return False
+    print(json.dumps({"success": True, "httpStatus": response.status_code,
+                      "toolNames": [tool["name"] for tool in tools]}))
+    return True
+
+
 def call_mcp_tool(mcp_url, auth, tool_name, arguments, timeout=30, headers=None):
     """Call an MCP tool and return the first text block on success."""
     import requests
@@ -320,12 +344,12 @@ def main():
     )
     parser.add_argument(
         "--mcp-url",
-        default=os.environ.get("MCP_SERVER_URL", ""),
+        default=os.environ.get("HUMANOID_MCP_SERVER_URL") or os.environ.get("MCP_SERVER_URL", ""),
         help="MCP endpoint URL (or set MCP_SERVER_URL)",
     )
     parser.add_argument(
         "--auth-mode",
-        default=os.environ.get("MCP_AUTH_MODE", "iam"),
+        default=os.environ.get("HUMANOID_MCP_AUTH_MODE") or os.environ.get("MCP_AUTH_MODE", "iam"),
         help="MCP auth mode: iam, api-key, or none. Default: iam",
     )
     parser.add_argument(
@@ -335,10 +359,11 @@ def main():
     )
     parser.add_argument(
         "--api-key-header",
-        default=os.environ.get("MCP_API_KEY_HEADER", "x-api-key"),
+        default=os.environ.get("HUMANOID_MCP_API_KEY_HEADER") or os.environ.get("MCP_API_KEY_HEADER", "x-api-key"),
         help="Header name to use with --api-key. Default: x-api-key",
     )
     parser.add_argument("--list-actions", action="store_true", help="List all available actions")
+    parser.add_argument("--check-connection", action="store_true", help="Read-only signed MCP tools/list")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Output JSON")
     args = parser.parse_args()
 
@@ -346,9 +371,9 @@ def main():
         list_actions()
         sys.exit(0)
 
-    if not args.robot_id:
+    if not args.robot_id and not args.check_connection:
         parser.error("--robot-id is required (unless using --list-actions)")
-    if not args.action and not args.sequence and not args.speak:
+    if not args.action and not args.sequence and not args.speak and not args.check_connection:
         parser.error("--action, --sequence, or --speak is required")
     if not args.mcp_url:
         logger.error("--mcp-url or MCP_SERVER_URL is required")
@@ -361,6 +386,9 @@ def main():
 
     auth = create_auth(auth_mode, args.region, args.mcp_url)
     headers = build_headers(args.api_key_header, args.api_key)
+
+    if args.check_connection:
+        sys.exit(0 if check_connection(args.mcp_url, auth, headers) else 1)
 
     if args.speak:
         ok, text = execute_speech(

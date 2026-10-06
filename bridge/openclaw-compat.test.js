@@ -54,7 +54,17 @@ it("validates both providers and exercises a real 2026.9.7 gateway", {
     const version = await runFile(binary, ["--version"], { env, timeout: 60000 });
     assert.match(version.stdout, /2026\.9\.7/);
     contract.writeOpenClawConfig({ gatewayToken: token });
+    const configPath = path.join(home, ".openclaw", "openclaw.json");
+    const stale = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    stale.skills.entries.humanoid.env.MCP_SERVER_URL = "https://stale.invalid/mcp";
+    fs.writeFileSync(`${configPath}.last-good`, JSON.stringify(stale));
+    contract.writeOpenClawConfig({ gatewayToken: token });
     await runFile(binary, ["config", "validate", "--json"], { env, timeout: 60000 });
+    const configuredMcp = await runFile(binary, [
+      "config", "get", "skills.entries.humanoid.env.MCP_SERVER_URL",
+    ], { env, timeout: 60000 });
+    assert.match(configuredMcp.stdout, /example\.invalid/);
+    assert.doesNotMatch(configuredMcp.stdout, /stale\.invalid/);
 
     process.env.LITELLM_BASE_URL = "http://127.0.0.1:18790/v1";
     process.env.LITELLM_API_KEY = "compat-key";

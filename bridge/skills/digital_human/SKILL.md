@@ -28,6 +28,7 @@ cd {baseDir} && ./run.sh --message "The next match is starting now" --json
 - The runtime reuses `HUMANOID_MCP_SERVER_URL` for this skill's MCP endpoint
 - The runtime reuses `HUMANOID_MCP_AUTH_MODE` and `HUMANOID_MCP_API_KEY_HEADER` for auth configuration
 - AWS credentials are provided by the AgentCore runtime automatically
+- Current `HUMANOID_MCP_*` environment settings take precedence over per-skill `MCP_*` defaults; explicit flags override both
 
 If you use API-key mode, provide the key to the skill process securely and avoid hardcoding it into source control.
 

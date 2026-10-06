@@ -369,7 +369,12 @@ For teardown, `undeploy.sh --env prod` has one extra compatibility rule: if no `
 
 It also fails fast when `OPENCLAW_ENV_SUFFIX` / `environment_suffix` points at a named environment like `dev` but you forgot to select the matching env file.
 
-Runtime settings are CDK-owned. In particular, `dashboard_api_push_url`, `humanoid_mcp_server_url`, `humanoid_mcp_auth_mode`, `humanoid_mcp_function_arn`, and `humanoid_mcp_api_key_header` should be set in `cdk.json` context rather than `.env*` files.
+Runtime settings are CDK-owned. `dashboard_api_push_url` remains in `cdk.json`
+context. Humanoid MCP settings can be supplied by the selected `.env*` file
+(`HUMANOID_MCP_SERVER_URL`, `HUMANOID_MCP_AUTH_MODE`,
+`HUMANOID_MCP_FUNCTION_ARN`, `HUMANOID_MCP_API_KEY_HEADER`), which takes precedence
+over the corresponding lowercase CDK context settings. AgentCore gateway URLs
+are resolved to their exact gateway ARN for IAM permissions.
 
 ### LiteLLM (optional)
 
@@ -734,7 +739,10 @@ All tunable parameters are in `cdk.json`:
 
 Set `environment_suffix` in `cdk.json` or override it per run with `OPENCLAW_ENV_SUFFIX`, for example `OPENCLAW_ENV_SUFFIX=prod ./scripts/deploy.sh` or `./scripts/deploy.sh --env prod`. The deploy, undeploy, setup, and E2E helper scripts derive the same suffixed stack names, secret IDs, and DynamoDB table names automatically.
 
-The runtime-facing MCP and dashboard settings are configured in `cdk.json` context (`dashboard_api_push_url`, `humanoid_mcp_server_url`, `humanoid_mcp_auth_mode`, `humanoid_mcp_function_arn`, `humanoid_mcp_api_key_header`) so CDK owns both the runtime env injection and the matching IAM grant.
+CDK owns both runtime env injection and the matching IAM grant. MCP settings
+prefer the selected env file and fall back to CDK context; dashboard settings
+remain in CDK context. See [native OpenClaw diagnostics](docs/openclaw-debugging.md)
+for model-independent log retrieval and read-only MCP connectivity checks.
 
 Named resources that are intentionally long-lived are auto-reused during synth when they already exist with the expected suffixed name. Today that includes:
 
