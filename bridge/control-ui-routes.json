@@ -1,0 +1,29 @@
+{
+  "spaPaths": [
+    "/", "/index.html", "/settings", "/chat", "/terminal", "/dashboard",
+    "/dashboards", "/custodian", "/new", "/activity", "/meetings", "/apps",
+    "/portals", "/agents", "/channels", "/config", "/profile",
+    "/communications", "/appearance", "/lobsterdex", "/automation", "/mcp",
+    "/infrastructure", "/ai-agents", "/model-setup", "/model-providers",
+    "/memory-import", "/workboard", "/worktrees", "/sessions", "/systems",
+    "/usage", "/debug", "/logs", "/skills", "/skills/workshop", "/plugins",
+    "/automations", "/cron", "/nodes", "/plugin", "/approve", "/ask", "/focus"
+  ],
+  "spaPrefixes": [
+    "/chat/", "/dashboard/", "/agents/", "/activity/", "/workboard/",
+    "/terminal/", "/plugin/", "/approve/", "/ask/", "/focus/",
+    "/settings/"
+  ],
+  "resources": [
+    "workspace-icon", "channel-avatar", "catalog-icon", "link-favicon",
+    "plugin-icon", "plugin-activity-icon", "plugin-theme-art"
+  ],
+  "configPaths": [
+    "/control-ui-config.json", "/__openclaw__/control-ui-config.json",
+    "/__openclaw/control-ui-config.json"
+  ],
+  "navigationQueries": [
+    "session", "agent", "catalog", "host", "thread", "theme", "themeId",
+    "openclawHostTheme", "openclaw_mount_recovery"
+  ]
+}

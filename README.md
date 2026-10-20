@@ -1108,6 +1108,10 @@ Bedrock invocation logs flow to CloudWatch, where a Lambda processor extracts to
 
 ## Operations
 
+For the real bundled OpenClaw dashboard in **dev only**, see
+[Control UI localhost relay and explicit device pairing](docs/control-ui.md).
+This targets an existing Telegram session and does not change production access.
+
 ### Check runtime status
 
 ```bash

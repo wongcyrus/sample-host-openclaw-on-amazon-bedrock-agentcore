@@ -52,6 +52,10 @@ const {
 const { createChatRunTracker } = require("./chat-run-filter");
 const { readBody } = require("./read-body");
 const { collectDiagnostics } = require("./runtime-diagnostics");
+const {
+  CONTROL_UI_HEADER, controlUiConfig, parseControlUiRoute,
+  fetchControlUi, runDeviceCommand, proxyControlUi,
+} = require("./control-ui");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -105,7 +109,7 @@ const SCOPED_CREDS_DIR = "/tmp/scoped-creds";
 const IDENTITY_FILE = "/tmp/current-identity.json";
 const BROWSER_SESSION_FILE = "/tmp/agentcore-browser-session.json";
 const BROWSER_SESSION_TIMEOUT_SECONDS = 3600;
-const BUILD_VERSION = "v41"; // Bump in cdk.json to force container redeploy
+const BUILD_VERSION = "v44"; // Bump in cdk.json to force container redeploy
 
 // Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
 // The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
@@ -142,6 +146,7 @@ let messageQueue = [];
 let processingMessage = false;
 const dashboardClients = new Set();
 const dashboardWss = new WebSocket.WebSocketServer({ noServer: true });
+const controlUiWss = new WebSocket.WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 const DASHBOARD_EVENT_BUFFER_LIMIT = 250;
 let dashboardEventSeq = 0;
 let dashboardEventBuffer = [];
@@ -1083,9 +1088,7 @@ function writeOpenClawConfig({ gatewayToken = GATEWAY_TOKEN } = {}) {
       port: OPENCLAW_PORT,
       trustedProxies: ["127.0.0.1"],
       auth: { mode: "token", token: gatewayToken },
-      controlUi: {
-        enabled: false,
-      },
+      controlUi: controlUiConfig(),
     },
     channels: {}, // No channels — messages bridged via WebSocket
     cron: { enabled: false }, // EventBridge owns scheduling, including after the version upgrade.
@@ -2320,6 +2323,29 @@ const server = http.createServer(async (req, res) => {
         const payload = body ? JSON.parse(body) : {};
         const action = payload.action || "status";
 
+        if (action === "control_ui_http" || action === "control_ui_devices") {
+          try {
+            parseControlUiRoute(JSON.stringify({ userId: payload.userId, origin: payload.origin }), {
+              userId: currentUserId, ready: openclawReady,
+            });
+          } catch {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Dev Control UI requires the initialized session owner" }));
+            return;
+          }
+          try {
+            const result = action === "control_ui_http"
+              ? await fetchControlUi(payload)
+              : await runDeviceCommand(payload, { env: lastOpenClawEnv });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(result));
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Control UI request failed; check the path or pairing request ID" }));
+          }
+          return;
+        }
+
         if (action === "diagnostics") {
           if (!currentUserId || payload.userId !== currentUserId) {
             res.writeHead(403, { "Content-Type": "application/json" });
@@ -2978,6 +3004,20 @@ server.on("upgrade", (req, socket, head) => {
 
   if (parsedUrl.pathname !== "/ws") {
     socket.destroy();
+    return;
+  }
+
+  if (req.headers[CONTROL_UI_HEADER] !== undefined) {
+    let route;
+    try {
+      route = parseControlUiRoute(req.headers[CONTROL_UI_HEADER], {
+        userId: currentUserId, ready: openclawReady,
+      });
+    } catch {
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    controlUiWss.handleUpgrade(req, socket, head, (ws) => proxyControlUi(ws, route));
     return;
   }
 

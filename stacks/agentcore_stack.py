@@ -552,6 +552,7 @@ class AgentCoreStack(Stack):
             "AWS_REGION": region,
             "BEDROCK_MODEL_ID": default_model_id,
             "OPENCLAW_ENVIRONMENT": suffix or "prod",
+            "OPENCLAW_CONTROL_UI": "1" if is_dev else "0",
             "GATEWAY_TOKEN_SECRET_ID": gateway_token_secret_arn,
             "COGNITO_USER_POOL_ID": cognito_user_pool_id,
             "COGNITO_CLIENT_ID": cognito_client_id,
@@ -655,6 +656,14 @@ class AgentCoreStack(Stack):
 
         runtime_cfn = self.runtime.node.default_child
         if isinstance(runtime_cfn, agentcore.CfnRuntime):
+            if is_dev:
+                runtime_cfn.request_header_configuration = (
+                    agentcore.CfnRuntime.RequestHeaderConfigurationProperty(
+                        request_header_allowlist=[
+                            "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Control-UI"
+                        ],
+                    )
+                )
             runtime_cfn.filesystem_configurations = [
                 agentcore.CfnRuntime.FilesystemConfigurationProperty(
                     session_storage=agentcore.CfnRuntime.SessionStorageConfigurationProperty(

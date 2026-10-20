@@ -118,6 +118,8 @@ RUN mkdir -p /root/.openclaw
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY read-body.js chat-run-filter.js /app/
 COPY runtime-diagnostics.js /app/
+COPY control-ui.js /app/
+COPY control-ui-routes.json /app/
 COPY dashboard-gateway.js /app/dashboard-gateway.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
